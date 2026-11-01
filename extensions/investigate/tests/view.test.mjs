@@ -99,7 +99,7 @@ test('rendering draws one coloured box per step under the agent handle, within t
   assert(plain(lines[0]).startsWith(`◆ ET.InvestigationAgent('${u(0)}')`));
   const heads = lines.filter(l => /\x1b\[4\dm \x1b\[36m\x1b\[1m\w/.test(l));
   assert.deepEqual(heads.map(l => [plain(l).trim().split(/\s+/)[0], Number(l.match(/\x1b\[(4\d)m/)[1])]), [
-    ['request', 41], ['model', 42], ['tool', 44], ['tool', 45], ['submit', 44], ['end', 44],
+    ['request', 41], ['model', 42], ['tool', 44], ['tool', 45], ['submit', 44], ['end', 44], ['result', 44],
   ], 'model and tool steps have different colours; errors stand out');
   assert(plain(lines.find(l => plain(l).includes('read src/config.mjs'))).includes('✓ 1.2s'));
   assert(lines.some(l => plain(l).includes('FINAL TEXT')));
@@ -157,4 +157,20 @@ test('clicking a block toggles only that block; other clicks fall through to Pi'
   // A new renderResult call (a later update) keeps the open blocks.
   const again = renderInvestigationResult({ content: [], details: { view: v } }, { expanded: false, isPartial: true }, style, { ...ctx, lastComponent: component });
   assert(shows(again.render(60), 'line B.0'));
+});
+
+test('the result returned to the parent is its own box, open by default and collapsible', () => {
+  const v = view(update(update(init('r1'), { type: 'agent', agent }), { type: 'phase', phase: 'completed' }));
+  const final = Array.from({ length: 6 }, (_, i) => `answer line ${i}`).join('\n');
+  const { lines, hits } = renderView(v, style, 60, { expanded: true, final });
+  const head = lines.findIndex(l => plain(l).includes('returned to the parent'));
+  assert(head > 0 && lines[head].includes('\x1b[44m'), 'result box has a background');
+  const body = lines.slice(head + 1).filter(l => plain(l).includes('answer line'));
+  assert.equal(body.length, 6, 'open by default');
+  assert(body.every(l => l.includes('\x1b[44m')), 'every result line is inside the box');
+  assert.equal(hits[head], 'result');
+  const closed = renderView(v, style, 60, { expanded: true, final, open: new Set(['result']) }).lines;
+  assert(closed.some(l => plain(l).includes('… 3 more lines')) && !closed.some(l => plain(l).includes('answer line 0')));
+  const failed = renderView(v, style, 60, { expanded: true, final, failed: true }).lines;
+  assert(failed.find(l => plain(l).includes('returned to the parent')).includes('\x1b[45m'), 'failures use the error colour');
 });

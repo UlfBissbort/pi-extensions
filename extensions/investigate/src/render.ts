@@ -8,7 +8,7 @@ import type { AgentView, Block } from './view.ts';
 export type Style = Pick<Theme, 'fg' | 'bg' | 'bold'>;
 type Fg = Parameters<Theme['fg']>[0];
 type Bg = Parameters<Theme['bg']>[0];
-export type RenderOptions = { expanded: boolean; final?: string; open?: ReadonlySet<string> };
+export type RenderOptions = { expanded: boolean; final?: string; failed?: boolean; open?: ReadonlySet<string> };
 
 const COLLAPSED_BLOCKS = 5;
 const COLLAPSED_LINES = 3;
@@ -22,7 +22,7 @@ export function safeDisplay(value: unknown): string {
 
 const LABEL: Record<Block['kind'], [string, Fg]> = {
   request: ['request', 'muted'], model: ['model', 'accent'], tool: ['tool', 'toolTitle'],
-  submit: ['submit', 'success'], note: ['host', 'warning'], end: ['end', 'muted'],
+  submit: ['submit', 'success'], note: ['host', 'warning'], end: ['end', 'muted'], result: ['result', 'success'],
 };
 function background(block: Block): Bg {
   if (block.status === 'error') return 'toolErrorBg';
@@ -45,6 +45,8 @@ export const toggleBlock = (open: OpenBlocks, key: string): OpenBlocks => {
   if (!next.delete(key)) next.add(key);
   return next;
 };
+
+const RESULT_KEY = 'result';
 
 // Rendered lines plus, per line, the key of the block a click on it toggles.
 export type Rendered = { lines: string[]; hits: (string | undefined)[] };
@@ -87,9 +89,11 @@ export function renderView(view: AgentView, style: Style, width: number, options
     hits.push(undefined, ...rendered.hits);
   }
   if (options.final !== undefined && options.expanded) {
-    const final = ['', style.fg('muted', 'Result returned to the parent:'), ...safeDisplay(options.final).split('\n').flatMap(l => wrapTextWithAnsi(l, w))];
-    lines.push(...final);
-    hits.push(...final.map(() => undefined));
+    // The result box starts open: expanding the tool output is a request to read it.
+    const result: Block = { key: RESULT_KEY, kind: 'result', status: options.failed ? 'error' : 'ok', title: 'returned to the parent', text: options.final };
+    const rendered = blockLines(result, style, w, !open.has(RESULT_KEY));
+    lines.push('', ...rendered.lines);
+    hits.push(undefined, ...rendered.hits);
   }
   return { lines, hits };
 }
@@ -141,7 +145,7 @@ export const renderInvestigationResult: NonNullable<ToolDefinition['renderResult
   const text = result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
   component.onToggle = key => { ui.open = toggleBlock(ui.open ?? new Set(), key); context.invalidate(); };
   component.draw = padded(view
-    ? width => renderView(view, theme, width, { expanded: options.expanded, open: ui.open, ...(options.isPartial ? {} : { final: text }) })
+    ? width => renderView(view, theme, width, { expanded: options.expanded, open: ui.open, ...(options.isPartial ? {} : { final: text, failed: context.isError }) })
     : textLines(theme.fg(context.isError ? 'error' : 'muted', safeDisplay(text || 'Starting investigation…'))), context.outputPad);
   return component;
 };

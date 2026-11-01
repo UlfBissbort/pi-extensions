@@ -29,7 +29,7 @@ export function update(model: UiModel, msg: UiMsg): UiModel {
 }
 
 // View: plain data, safe to store in tool-result details and bounded in size.
-export type BlockKind = 'request' | 'model' | 'tool' | 'submit' | 'note' | 'end';
+export type BlockKind = 'request' | 'model' | 'tool' | 'submit' | 'note' | 'end' | 'result';
 export type BlockStatus = 'info' | 'streaming' | 'running' | 'ok' | 'error';
 export type Block = { key: string; kind: BlockKind; status: BlockStatus; title: string; text: string; durationMs?: number };
 export type AgentView = {
