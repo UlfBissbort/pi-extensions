@@ -7,6 +7,7 @@ const { createJiti } = requireHost('jiti');
 const jiti = createJiti(import.meta.url, { alias: {
   '@earendil-works/pi-coding-agent': `${host}/dist/index.js`,
   '@earendil-works/pi-tui': `${host}/node_modules/@earendil-works/pi-tui/dist/index.js`,
+  '@earendil-works/pi-ai': `${host}/node_modules/@earendil-works/pi-ai/dist/compat.js`,
 } });
 const { initialProgress, reduceProgress, progressLines, safeDisplay, createProgressReporter, createWorkerProgress } = await jiti.import('../src/progress.ts');
 const { renderInvestigationCall, renderInvestigationResult } = await jiti.import('../src/render.ts');

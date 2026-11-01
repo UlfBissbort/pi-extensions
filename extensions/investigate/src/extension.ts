@@ -5,6 +5,12 @@ import { createSemaphore, limitsForEffort, normalizeRequest, zeroUsage } from '.
 import { requestSchema, runInvestigation } from './worker.ts';
 import { createProgressReporter } from './progress.ts';
 import { renderInvestigationCall, renderInvestigationResult } from './render.ts';
+import { status, type InvestigationAgent, type Uid } from './agent.ts';
+
+// Agents stay in memory after their run so a later step can resume them. Oldest
+// agents are dropped first once the cap is reached.
+const MAX_AGENTS = 100;
+const agentHandle = (agent: InvestigationAgent) => `ET.InvestigationAgent('${agent.__uid}')`;
 
 export async function registerInvestigation(pi: ExtensionAPI, root: string, dependencies = {
   createRuntime: (signal: AbortSignal) => ModelRuntime.create({ signal }),
@@ -12,6 +18,12 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
   const initial = await loadConfig(root);
   const slots = createSemaphore(initial.config.limits.maxConcurrentInvestigations);
   const active = new Set<{ controller: AbortController; done: Promise<void> }>();
+  const agents = new Map<Uid, InvestigationAgent>();
+  const keepAgent = (agent: InvestigationAgent) => {
+    agents.delete(agent.__uid);
+    agents.set(agent.__uid, agent);
+    while (agents.size > MAX_AGENTS) agents.delete(agents.keys().next().value!);
+  };
   let closed = false;
 
   pi.on('before_agent_start', async event => {
@@ -71,19 +83,19 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
         const freshSnapshot = { ...snapshot, ...await loadWorkerContext(root, snapshot.config) };
         controller.signal.throwIfAborted();
         progress.emit({ type: 'entry', key: 'context', kind: 'context loaded', text: `Initial prompt: ${snapshot.config.instructionsFile}\nRepo overview: ${snapshot.config.repositoryMapFile}` });
-        const result = await runInvestigation({ snapshot: freshSnapshot, request, cwd: ctx.cwd, signal: controller.signal, modelRuntime, onProgress: progress.emit });
+        const result = await runInvestigation({ snapshot: freshSnapshot, request, cwd: ctx.cwd, signal: controller.signal, modelRuntime, onProgress: progress.emit, onAgent: keepAgent });
         progress.emit({ type: 'phase', phase: 'completed', text: `Investigation finished; ${result.excerpts.length} excerpts included${result.warnings.length ? `, ${result.warnings.length} evidence warnings` : ''}.` });
         return {
           content: [{ type: 'text' as const, text: result.text }],
-          details: { requestId, progress: progress.snapshot(), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0 },
+          details: { requestId, progress: progress.snapshot(), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0, agent: agentHandle(result.agent), agentStatus: status(result.agent) },
           usage: result.usage,
         };
       } catch (error) {
-        const e = error as Error & { usage?: ReturnType<typeof zeroUsage>; turns?: number };
+        const e = error as Error & { usage?: ReturnType<typeof zeroUsage>; turns?: number; agent?: InvestigationAgent };
         progress.emit({ type: 'phase', phase: controller.signal.aborted ? 'cancelled' : 'failed', text: e.message });
         return {
           content: [{ type: 'text' as const, text: `Investigation failed or incomplete: ${e.message}` }],
-          details: { requestId, progress: progress.snapshot(), turns: e.turns ?? 0, elapsedMs: Date.now() - started },
+          details: { requestId, progress: progress.snapshot(), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(e.agent ? { agent: agentHandle(e.agent), agentStatus: status(e.agent) } : {}) },
           usage: e.usage ?? zeroUsage(), isError: true,
         };
       } finally {

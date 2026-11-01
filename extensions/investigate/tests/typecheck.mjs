@@ -12,7 +12,7 @@ try {
       target: 'ES2022', module: 'ESNext', moduleResolution: 'Bundler', strict: true,
       noEmit: true, allowImportingTsExtensions: true, allowJs: true, checkJs: false,
       skipLibCheck: true, types: ['node'], typeRoots: [`${host}/node_modules/@types`],
-      paths: { '@earendil-works/pi-coding-agent': [`${host}/dist/index.d.ts`], 'typebox': [`${host}/node_modules/typebox/build/index.d.mts`], '@earendil-works/pi-tui': [`${host}/node_modules/@earendil-works/pi-tui/dist/index.d.ts`] },
+      paths: { '@earendil-works/pi-coding-agent': [`${host}/dist/index.d.ts`], 'typebox': [`${host}/node_modules/typebox/build/index.d.mts`], '@earendil-works/pi-tui': [`${host}/node_modules/@earendil-works/pi-tui/dist/index.d.ts`], '@earendil-works/pi-ai': [`${host}/node_modules/@earendil-works/pi-ai/dist/compat.d.ts`] },
     },
     include: [`${root}/src/**/*.ts`, `${root}/src/**/*.mjs`, `${root}/index.ts`],
   };

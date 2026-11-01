@@ -15,6 +15,7 @@ const jiti = createJiti(import.meta.url, {
     '@earendil-works/pi-coding-agent': `${host}/dist/index.js`,
     'typebox': requireHost.resolve('typebox'),
     '@earendil-works/pi-tui': `${host}/node_modules/@earendil-works/pi-tui/dist/index.js`,
+    '@earendil-works/pi-ai': `${host}/node_modules/@earendil-works/pi-ai/dist/compat.js`,
   },
 });
 const { runInvestigation, isolatedResources } = await jiti.import('../src/worker.ts');

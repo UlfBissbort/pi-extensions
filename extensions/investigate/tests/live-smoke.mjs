@@ -9,7 +9,7 @@ if (!process.argv.includes('--run')) throw new Error('Pass --run to authorize th
 import { host } from './host.mjs';
 const requireHost = createRequire(`${host}/package.json`);
 const { createJiti } = requireHost('jiti');
-const jiti = createJiti(import.meta.url, { alias: { '@earendil-works/pi-coding-agent': `${host}/dist/index.js`, typebox: requireHost.resolve('typebox') } });
+const jiti = createJiti(import.meta.url, { alias: { '@earendil-works/pi-coding-agent': `${host}/dist/index.js`, typebox: requireHost.resolve('typebox'), '@earendil-works/pi-ai': `${host}/node_modules/@earendil-works/pi-ai/dist/compat.js` } });
 const { runInvestigation } = await jiti.import('../src/worker.ts');
 const { ModelRuntime } = await import(`${host}/dist/index.js`);
 const snapshot = await loadConfig(new URL('../', import.meta.url).pathname);
