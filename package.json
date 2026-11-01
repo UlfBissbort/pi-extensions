@@ -1,0 +1,23 @@
+{
+  "name": "ulf-pi-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A collection of Pi coding agent extensions",
+  "repository": { "type": "git", "url": "https://github.com/UlfBissbort/pi-extensions.git" },
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": [
+      "./extensions/investigate/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test extensions/investigate/tests/*.test.mjs",
+    "typecheck": "node extensions/investigate/tests/typecheck.mjs"
+  }
+}

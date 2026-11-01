@@ -1,0 +1,26 @@
+{
+  "provider": "openai",
+  "model": "gpt-6-luna",
+  "thinkingLevel": "medium",
+  "instructionsFile": "./prompts/worker.md",
+  "parentPromptFile": "./prompts/parent.md",
+  "repositoryMapFile": "./repository-map.md",
+  "defaults": { "detail": "standard", "includeReferences": true, "effort": 4 },
+  "effortScale": {
+    "exponent": 1.3,
+    "minimum": { "maxTurns": 2, "timeoutSeconds": 30, "maxAnswerCharacters": 6000, "maxResponseCharacters": 12000, "maxExcerpts": 2 },
+    "maximum": { "maxTurns": 150, "timeoutSeconds": 600, "maxAnswerCharacters": 120000, "maxResponseCharacters": 240000, "maxExcerpts": 40 }
+  },
+  "tools": { "allowBash": true },
+  "limits": {
+    "maxConcurrentInvestigations": 3,
+    "maxTurns": 20,
+    "timeoutSeconds": 180,
+    "maxRequestCharacters": 24000,
+    "maxAnswerCharacters": 24000,
+    "maxExcerpts": 15,
+    "maxExcerptCharacters": 12000,
+    "maxResponseCharacters": 48000,
+    "maxFileBytes": 2097152
+  }
+}

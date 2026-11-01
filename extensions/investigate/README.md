@@ -1,0 +1,56 @@
+# Investigate
+
+A Pi tool for bounded research in a fresh model session. The caller supplies a self-contained question; the investigator searches and reads, then returns its answer and optional exact file excerpts. The parent conversation does not receive the exploration trace.
+
+## Install this extension only
+
+From the repository root, run `pi install ./extensions/investigate`, then `/reload` in Pi or start a new session. Pi loads `index.ts` directly; no compilation or npm installation is needed. Keep the clone in place because Pi registers the local source path rather than copying it. Do not load a second copy of the extension.
+
+## Model and local configuration
+
+Defaults in `config.json` are `provider: "openai"`, `model: "gpt-6-luna"`, and `thinkingLevel: "medium"`. Use your own Pi provider login. Availability depends on your account and configured model registry.
+
+Create an optional `config.local.json` in this directory to change the model without editing tracked files:
+
+```json
+{
+  "provider": "anthropic",
+  "model": "REPLACE_WITH_YOUR_AVAILABLE_HAIKU_MODEL_ID",
+  "thinkingLevel": "off"
+}
+```
+
+Replace the placeholder using the exact model ID available in Pi. There is no automatic fallback. Supported thinking-level values are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`, but the chosen model must support the requested level. Reload after changes.
+
+Local overrides are shallow: any supplied nested section replaces that entire default section. For example, `"tools": { "allowBash": false }` disables the general shell tool. Do not put API keys in configuration; use Pi's authentication mechanism.
+
+The default repository overview is generic and starts from the caller's current directory. To supply your own repository orientation, set `repositoryMapFile` to an absolute path to a Markdown file. Relative paths resolve against this extension directory. Custom prompt paths follow the same rule. Do not commit personal repository maps or prompts.
+
+## Tool API
+
+```typescript
+investigate({
+  question: "Where is request cancellation implemented, and how is it tested?",
+  context: "We need to understand existing behavior before changing it.",
+  scope: ["./src", "./tests"],
+  detail: "standard",
+  include_references: true,
+  effort: 4
+})
+```
+
+Only `question` is required. `detail` is `brief`, `standard`, or `detailed`. `effort` is an integer from 0 to 10 (default 4), controlling request, time, output, and excerpt budgets. Scope indicates where to prioritize research, not an access restriction. The default permits three simultaneous investigations. Edit the full defaults in `config.json` only when the simple local override is insufficient.
+
+The tool returns the answer followed by selected file ranges with provenance. Excerpts are read at submission time and can differ from earlier inspected content. Missing or oversized excerpts are reported. The UI retains bounded public activity metadata; this is not private reasoning or the complete worker trace.
+
+## Boundaries
+
+The worker uses read, grep, find, ls, optionally bash, and its completion tool. It does not inherit the parent transcript or automatically load its extensions, skills, or general instructions. The parent receives prompt guidance encouraging frequent use of this tool while it is active; inspect the bundled prompts if that policy matters to you.
+
+This is not a sandbox or a guarantee of read-only execution. Shell access is enabled by default, and even with bash disabled the worker can read files accessible to Pi. Source contents may be sent to the model provider. Requests incur usage on the configured account. Do not use live smoke tests without permission.
+
+## Checks
+
+`npm test` in this directory runs offline tests with scripted model responses. `npm run typecheck` checks TypeScript using a recent compiler. The tests discover the global npm Pi installation; set `PI_INVESTIGATE_HOST` for another location. Set `PI_TYPESCRIPT` to a compiler's `tsc` JavaScript file when needed. `npm run test:live` is an explicit opt-in authenticated model request using a temporary fixture.
+
+Checked against Pi 1.2.0. Older versions and other providers are not automatically certified by the offline suite.
