@@ -16,7 +16,8 @@ const jiti = createJiti(import.meta.url, {
 });
 const { init, update, view, MAX_BLOCKS, MAX_TOTAL_TEXT } = await jiti.import('../src/view.ts');
 const { renderView, renderInvestigationCall, renderInvestigationResult } = await jiti.import('../src/render.ts');
-const { visibleWidth } = await import(`${host}/node_modules/@earendil-works/pi-tui/dist/index.js`);
+const { holdScroll } = await jiti.import('../src/scroll.ts');
+const { visibleWidth, ScrollView } = await import(`${host}/node_modules/@earendil-works/pi-tui/dist/index.js`);
 
 // A recorded agent as plain data: the UI must be derivable from this alone.
 const u = n => `🍃-${String(n).padStart(20, '0')}`;
@@ -173,4 +174,29 @@ test('the result returned to the parent is its own box, open by default and coll
   assert(closed.some(l => plain(l).includes('… 3 more lines')) && !closed.some(l => plain(l).includes('answer line 0')));
   const failed = renderView(v, style, 60, { expanded: true, final, failed: true }).lines;
   assert(failed.find(l => plain(l).includes('returned to the parent')).includes('\x1b[45m'), 'failures use the error colour');
+});
+
+test('toggling a box at the bottom of the transcript keeps the clicked line on its screen row', () => {
+  // Real pi-tui ScrollView: the transcript follows its end, as when Pi is scrolled to the bottom.
+  const transcript = new ScrollView({ render: () => [], invalidate() {} }, { follow: 'end', primary: true });
+  const viewport = 20, before = 100, clickedLine = 90, grows = 12;
+  transcript.updateLayout(before, viewport, () => {});
+  const row = () => clickedLine - transcript.scrollTop;
+  const start = row();
+  assert.equal(transcript.isFollowingEnd, true);
+
+  const command = holdScroll({ top: transcript.scrollTop, following: transcript.isFollowingEnd });
+  transcript.scrollTo(command.scrollTo, { disableFollow: command.disableFollow });
+  transcript.updateLayout(before + grows, viewport, () => {});
+  assert.equal(row(), start, 'expanding does not move the clicked line');
+
+  transcript.updateLayout(before, viewport, () => {});
+  assert.equal(row(), start, 'collapsing it again does not move it either');
+  assert.equal(holdScroll({ top: 5, following: false }), undefined, 'scrolled-up transcripts already keep their offset');
+
+  // Without the command, following the end pushes the clicked line up by the growth.
+  const unheld = new ScrollView({ render: () => [], invalidate() {} }, { follow: 'end', primary: true });
+  unheld.updateLayout(before, viewport, () => {});
+  unheld.updateLayout(before + grows, viewport, () => {});
+  assert.equal(clickedLine - unheld.scrollTop, start - grows);
 });

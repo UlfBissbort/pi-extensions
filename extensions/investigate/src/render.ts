@@ -4,6 +4,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from '@earendil-works/pi-tui';
 import type { Theme, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { AgentView, Block } from './view.ts';
+import { keepScrollPosition } from './scroll.ts';
 
 export type Style = Pick<Theme, 'fg' | 'bg' | 'bold'>;
 type Fg = Parameters<Theme['fg']>[0];
@@ -143,7 +144,7 @@ export const renderInvestigationResult: NonNullable<ToolDefinition['renderResult
   const ui = context.state as { open?: OpenBlocks };
   const view = (result.details as { view?: AgentView } | undefined)?.view;
   const text = result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-  component.onToggle = key => { ui.open = toggleBlock(ui.open ?? new Set(), key); context.invalidate(); };
+  component.onToggle = key => { keepScrollPosition(); ui.open = toggleBlock(ui.open ?? new Set(), key); context.invalidate(); };
   component.draw = padded(view
     ? width => renderView(view, theme, width, { expanded: options.expanded, open: ui.open, ...(options.isPartial ? {} : { final: text, failed: context.isError }) })
     : textLines(theme.fg(context.isError ? 'error' : 'muted', safeDisplay(text || 'Starting investigation…'))), context.outputPad);

@@ -6,6 +6,7 @@ import { requestSchema, runInvestigation } from './worker.ts';
 import { init, update, view, type AgentView, type UiMsg } from './view.ts';
 import { renderInvestigationCall, renderInvestigationResult } from './render.ts';
 import { status, type InvestigationAgent, type Uid } from './agent.ts';
+import { setTui } from './scroll.ts';
 
 // Agents stay in memory after their run so a later step can resume them. Oldest
 // agents are dropped first once the cap is reached.
@@ -55,6 +56,11 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
       const snapshot = await loadConfig(root);
       event.systemPromptOptions.sections.investigation = snapshot.parentPrompt;
     } else delete event.systemPromptOptions.sections.investigation;
+  });
+  // An empty widget below the editor is the public way to receive the TUI; it renders no lines.
+  pi.on('session_start', async (_event, ctx) => {
+    if (!ctx.hasUI) return;
+    ctx.ui.setWidget('investigate-scroll', tui => { setTui(tui); return { render: () => [], invalidate() {} }; }, { placement: 'belowEditor' });
   });
   pi.on('session_shutdown', async () => {
     closed = true;
