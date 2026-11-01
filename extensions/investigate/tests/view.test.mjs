@@ -92,10 +92,10 @@ const plain = line => line.replace(/\x1b\[[0-9;]*m/g, '');
 test('rendering draws one coloured box per step under the agent handle, within the width', () => {
   const v = view(update(update(init('r1'), { type: 'agent', agent }), { type: 'phase', phase: 'completed' }));
   for (const width of [24, 60, 120]) {
-    const lines = renderView(v, style, width, { expanded: true });
+    const { lines } = renderView(v, style, width, { expanded: true });
     assert(lines.every(l => visibleWidth(l) <= width), `fits width ${width}`);
   }
-  const lines = renderView(v, style, 60, { expanded: true, final: 'FINAL TEXT' });
+  const { lines } = renderView(v, style, 60, { expanded: true, final: 'FINAL TEXT' });
   assert(plain(lines[0]).startsWith(`◆ ET.InvestigationAgent('${u(0)}')`));
   const heads = lines.filter(l => /\x1b\[4\dm \x1b\[36m\x1b\[1m\w/.test(l));
   assert.deepEqual(heads.map(l => [plain(l).trim().split(/\s+/)[0], Number(l.match(/\x1b\[(4\d)m/)[1])]), [
@@ -103,14 +103,14 @@ test('rendering draws one coloured box per step under the agent handle, within t
   ], 'model and tool steps have different colours; errors stand out');
   assert(plain(lines.find(l => plain(l).includes('read src/config.mjs'))).includes('✓ 1.2s'));
   assert(lines.some(l => plain(l).includes('FINAL TEXT')));
-  const collapsed = renderView(v, style, 60, { expanded: false, final: 'FINAL TEXT' });
+  const collapsed = renderView(v, style, 60, { expanded: false, final: 'FINAL TEXT' }).lines;
   assert(collapsed.some(l => plain(l).includes('1 earlier step · expand tool output to see more')));
   assert(!collapsed.some(l => plain(l).includes('FINAL TEXT')));
 });
 
 test('Pi renderers show the call until execution starts, then the chain; components are reused', () => {
   const theme = { ...style };
-  const ctx = { outputPad: 1, executionStarted: false, isError: false };
+  const ctx = { outputPad: 1, executionStarted: false, isError: false, state: {}, invalidate: () => {} };
   const callComponent = renderInvestigationCall({ question: 'Where?' }, theme, ctx);
   assert(plain(callComponent.render(40).join('\n')).includes('investigate Where?'));
   assert.equal(renderInvestigationCall({ question: 'Where?' }, theme, { ...ctx, executionStarted: true, lastComponent: callComponent }), callComponent);
@@ -123,4 +123,38 @@ test('Pi renderers show the call until execution starts, then the chain; compone
   const failed = renderInvestigationResult({ content: [{ type: 'text', text: 'Investigation failed: boom' }] }, { expanded: false, isPartial: false }, theme, { ...ctx, isError: true, lastComponent: partial });
   assert.equal(failed, partial);
   assert(plain(failed.render(40).join('\n')).includes('Investigation failed: boom'));
+});
+
+test('clicking a block toggles only that block; other clicks fall through to Pi', () => {
+  const long = n => Array.from({ length: 8 }, (_, i) => `line ${n}.${i}`).join('\n');
+  const two = { ...agent, context_: [agent.context_[0], agent.context_[1],
+    response(3, [{ type: 'text', text: long('A') }]), response(4, [{ type: 'text', text: long('B') }])] };
+  const v = view(update(init('r1'), { type: 'agent', agent: two }));
+  const state = {};
+  let invalidated = 0;
+  const ctx = { outputPad: 0, executionStarted: true, isError: false, state, invalidate: () => { invalidated++; } };
+  const component = renderInvestigationResult({ content: [], details: { view: v } }, { expanded: false, isPartial: true }, style, ctx);
+  const click = (text, lines) => component.handleMouse({ type: 'click', button: 'left', x: 2, y: lines.findIndex(l => plain(l).includes(text)), width: 60, height: lines.length });
+  const shows = (lines, text) => lines.some(l => plain(l).includes(text));
+
+  let lines = component.render(60);
+  assert(!shows(lines, 'line A.0') && !shows(lines, 'line B.0'), 'blocks start collapsed');
+  assert(shows(lines, '… 5 more lines'));
+  assert.equal(click('ET.InvestigationAgent', lines), undefined, 'header click is left to Pi');
+
+  assert.deepEqual(click('line A.7', lines), { handled: true });
+  lines = component.render(60);
+  assert(shows(lines, 'line A.0') && !shows(lines, 'line B.0'), 'only A expands');
+
+  click('line B.7', lines);
+  lines = component.render(60);
+  assert(shows(lines, 'line A.0') && shows(lines, 'line B.0'), 'expanding B keeps A open');
+
+  click('line A.0', lines);
+  lines = component.render(60);
+  assert(!shows(lines, 'line A.0') && shows(lines, 'line B.0'), 'collapsing A leaves B open');
+  assert.equal(invalidated, 3);
+  // A new renderResult call (a later update) keeps the open blocks.
+  const again = renderInvestigationResult({ content: [], details: { view: v } }, { expanded: false, isPartial: true }, style, { ...ctx, lastComponent: component });
+  assert(shows(again.render(60), 'line B.0'));
 });
