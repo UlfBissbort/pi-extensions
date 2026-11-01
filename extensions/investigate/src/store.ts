@@ -10,8 +10,8 @@ export type RunStore = {
   close(): void;
 };
 
-export function createRunStore(requestId: string, publish: (snapshot: Snapshot) => void = () => {}, railIndex = 0): RunStore {
-  let state = initRun(requestId, railIndex);
+export function createRunStore(requestId: string, publish: (snapshot: Snapshot) => void = () => {}, railIndex = 0, name?: string): RunStore {
+  let state = initRun(requestId, railIndex, name);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   const flush = () => {

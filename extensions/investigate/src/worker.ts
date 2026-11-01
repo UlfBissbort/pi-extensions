@@ -66,8 +66,8 @@ const declaration = ({ name, description, parameters, constrainedSampling }: Exe
 // Facts get their UIDs and timestamps here, where they arrive. Given an existing
 // agent, the run continues it: the request is appended to its record, and its
 // recorded model, thinking level, tools, and prompt are kept.
-export async function runInvestigation({ snapshot, request, cwd, signal, modelRuntime, store = createRunStore(randomUUID()), agent: previous }: {
-  snapshot: any; request: any; cwd: string; signal: AbortSignal; modelRuntime: ModelRuntime; store?: RunStore; agent?: InvestigationAgent;
+export async function runInvestigation({ snapshot, request, cwd, signal, modelRuntime, store = createRunStore(randomUUID()), agent: previous, name }: {
+  snapshot: any; request: any; cwd: string; signal: AbortSignal; modelRuntime: ModelRuntime; store?: RunStore; agent?: InvestigationAgent; name?: string;
 }) {
   const { workerPrompt, repositoryMap } = snapshot;
   const kept = previous && agentConfig(previous);
@@ -172,7 +172,7 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
         __type: 'ET.InvestigationConfig', __uid: newUid(),
         provider: model.provider, model: model.id, thinkingLevel: level, sessionId: randomUUID(),
         workerPrompt, repositoryMapSource: config.repositoryMapFile, repositoryMap,
-        cwd: root, tools: declarations, timestamp: now,
+        cwd: root, tools: declarations, timestamp: now, ...(name === undefined ? {} : { name }),
       },
       requestEntry,
     ] };

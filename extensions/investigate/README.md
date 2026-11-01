@@ -41,19 +41,21 @@ investigate({
 
 Only `question` is required. `detail` is `brief`, `standard`, or `detailed`. `effort` is an integer from 0 to 10 (default 4), controlling request, time, output, and excerpt budgets. Scope indicates where to prioritize research, not an access restriction. The default permits three simultaneous investigations. Edit the full defaults in `config.json` only when the simple local override is insufficient.
 
-Every result whose investigator exists starts with its handle and status, for example `ET.InvestigationAgent('🍃-…') answered`. The status is `answered` (an answer follows), `resumable` (stopped by budget, deadline, cancellation, or error; the reason follows), or `running` (this call did not start because the investigator is busy with an earlier one).
+Every result whose investigator exists starts with its name, handle, and status, for example `richard_the_lionheart = ET.InvestigationAgent('🍃-…') answered`. Names are drawn from `src/names.json` at launch and shown in the TUI from then on. A name is never issued twice in a session, also not after a reload: names from earlier results in the session file stay taken. Once all are used, numbered rounds follow (`erasmus_the_learned_2`). Investigators running at the same time get different first parts where possible. The status is `answered` (an answer follows), `resumable` (stopped by budget, deadline, cancellation, or error; the reason follows), or `running` (this call did not start because the investigator is busy with an earlier one).
 
-To continue an investigator, pass its handle as `agent` with the follow-up as `question`:
+To continue an investigator, pass its name or handle as `agent` with the follow-up as `question`:
 
 ```typescript
 investigate({
-  agent: "ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60')",
+  agent: "richard_the_lionheart",
   question: "How are nested sections of config.local.json combined?",
   effort: 2
 })
 ```
 
 It continues with its full previous context, including the files it read and its earlier answers. Its model, tools, working directory, and leading prompt are kept; `detail`, `include_references`, and `effort` (with its budgets and deadline) apply to the new call. An investigator handles one call at a time. Investigators are kept in memory, the most recent 100, and are lost on reload; an unknown handle returns an error.
+
+While an investigator runs, you can write to it from Pi's editor with `@name message`, for example `@richard_the… look in the tests instead`. A unique prefix is enough, with or without a trailing ellipsis. The message bypasses the parent and enters the investigator's conversation at its next turn boundary, after any running tool calls finish and before its next model request; the header shows how many are waiting. The parent's result lists the messages the investigator read, and any that arrived after it finished as unread. An `@` address that matches no investigator is passed to the parent as ordinary text; one that names a finished investigator is refused with a notice.
 
 The tool returns the answer followed by selected file ranges with provenance. Excerpts are read at submission time and can differ from earlier inspected content. Missing or oversized excerpts are reported. In the TUI, each investigation has a persistent coloured rail down its left edge, so adjacent or parallel agents remain distinguishable. A single click on a tool step opens its call arguments and the result returned to the investigator inside the same box; a second click closes it. Every step remains visible in order, even in long investigations; long arguments and text results are shortened per step, and non-text content such as images gets a placeholder. The snapshot grows with the number of steps. The parent model sees only the final answer, not these intermediate tool results, but Pi persists UI snapshots (including displayed results) in the parent session's tool details; a closed box is not a privacy boundary. Private model reasoning is never shown.
 

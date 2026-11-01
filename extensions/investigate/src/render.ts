@@ -73,6 +73,7 @@ function stepBox(step: Step): Box {
       body: step.error ? `${step.answer}\n\nRejected: ${step.error}` : step.answer,
     };
     case 'host': return { id: step.id, label: 'host', color: 'warning', title: '', status: 'info', body: step.text };
+    case 'user': return { id: step.id, label: 'you', color: 'mdLink', title: 'message from you', status: 'info', body: step.text };
     case 'end': return { id: step.id, label: 'end', color: 'muted', title: `run ended · ${step.reason}`, status: step.reason === 'submitted' ? 'ok' : 'error', body: step.message ?? '' };
   }
 }
@@ -143,11 +144,20 @@ export function renderDisplay(state: DisplayState, width: number, style: Style):
     const lines = wrapTextWithAnsi(style.fg(state.final?.failed ? 'error' : 'muted', safeDisplay(state.final?.text || 'Starting investigation…')), innerWidth);
     return { lines: lines.map(line => rail + line), targets: lines.map(() => undefined) };
   }
-  const identity = view.handle ? style.fg('accent', style.bold(view.handle)) : style.fg('toolTitle', style.bold('investigate'));
+  // The name is known from launch; the handle once the agent record exists.
+  const handle = view.handle ? style.fg('accent', view.handle) : undefined;
+  const identity = view.name
+    ? [style.fg('accent', style.bold(view.name)), handle].filter(Boolean).join(style.fg('dim', ' = '))
+    : handle ? style.fg('accent', style.bold(view.handle!)) : style.fg('toolTitle', style.bold('investigate'));
   // While a run is active the phase says most; once it ends, the agent's status does.
   const phase = ['queued', 'starting', 'running'].includes(view.phase) ? view.phase : view.agentStatus ?? view.phase;
-  const facts = [phase, plural(view.turns, 'model request'), state.defaultOpen ? view.model : undefined].filter(Boolean).join(' · ');
-  const lines = [truncateToWidth(`◆ ${identity} ${style.fg('dim', `· ${safeDisplay(facts)}`)}`, innerWidth, '…')];
+  const pending = view.pendingMessages ? `${plural(view.pendingMessages, 'message')} from you waiting` : undefined;
+  const facts = style.fg('dim', `· ${safeDisplay([phase, plural(view.turns, 'model request'), pending, state.defaultOpen ? view.model : undefined].filter(Boolean).join(' · '))}`);
+  // Name and handle together are long; the facts move to their own line rather than being cut off.
+  const header = `◆ ${identity} ${facts}`;
+  const lines = visibleWidth(header) <= innerWidth || !view.name
+    ? [truncateToWidth(header, innerWidth, '…')]
+    : [truncateToWidth(`◆ ${identity}`, innerWidth, '…'), truncateToWidth(`  ${facts}`, innerWidth, '…')];
   if (view.note && view.phase !== 'running') {
     const color: Fg = view.phase === 'failed' || view.phase === 'cancelled' ? 'error' : 'muted';
     lines.push(...wrapTextWithAnsi(style.fg(color, safeDisplay(view.note)), innerWidth));

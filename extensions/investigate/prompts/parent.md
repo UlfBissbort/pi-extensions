@@ -37,7 +37,7 @@ investigate({
 })
 ```
 
-- `agent`: Handle of an earlier investigator to continue it with everything it already did; see "New or continued investigator". Omit to start a new investigator.
+- `agent`: Name or handle of an earlier investigator to continue it with everything it already did; see "New or continued investigator". Omit to start a new investigator.
 - `question`: For a new investigator, a self-contained question or information-gathering objective. For a continued one, the follow-up only; it already has its earlier task and findings. State requirements such as comparisons, runnable examples, source excerpts, or search thoroughness here.
 - `context`: Relevant background and constraints. An investigator never sees your conversation; a new one also sees nothing of other investigations. When continuing, supply only new background.
 - `scope`: Optional repository/collection names from the available map, or explicit paths, to prioritize. This is a search focus, not an access restriction. When continuing, it applies to the follow-up.
@@ -47,10 +47,10 @@ investigate({
 
 ### Result
 
-Every result whose investigator exists starts with one line: its handle and status.
+Every result whose investigator exists starts with one line: its name, handle, and status. The name is assigned at launch and never reused in this session.
 
 ```text
-ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60') answered
+richard_the_lionheart = ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60') answered
 ```
 
 - `answered`: it submitted an answer, which follows.
@@ -58,6 +58,8 @@ ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60') answered
 - `running`: this call did not start because the investigator is still busy with an earlier call; its record is unaffected.
 
 A result without this line means no investigator was involved, for example an unknown handle, a configuration problem, or a cancellation while queued.
+
+The user can write to a running investigator directly, by typing `@name message`. Such messages take precedence over your request. When the investigator read any, the result lists them after the first line, and its answer takes them into account; treat them as the user's current wishes and do not repeat the original request against them. Messages that arrived after it finished are listed as unread; continue the investigator if they still need an answer.
 
 ### Effort guide
 
@@ -86,7 +88,7 @@ Before answering the user, match every requested target against the actual retur
 
 Continue an investigator when the next question builds on what it found: a follow-up, a correction, more source for something it located, or finishing a `resumable` run. It keeps its full previous context, including every file it read and its earlier answers, so it does not repeat the search; ask only for what is new. Start a new investigator for an unrelated question; its context is then small and focused. Each continuation resends the whole earlier history, so stop continuing once the topic has moved on.
 
-An investigator handles one call at a time. Do not continue the same handle in parallel calls; to explore several directions at once, start separate investigators. Handles last only while the extension stays loaded and only for recent investigators; an unknown handle returns an error, after which start a new investigation and pass what it needs in `context`.
+An investigator handles one call at a time. Do not continue the same handle in parallel calls; to explore several directions at once, start separate investigators. Names and handles last only while the extension stays loaded and only for recent investigators; an unknown one returns an error, after which start a new investigation and pass what it needs in `context`.
 
 ### Parallel investigations
 
@@ -132,7 +134,7 @@ Continue an investigator after its answer:
 
 ```javascript
 investigate({
-  agent: "ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60')",
+  agent: "richard_the_lionheart",
   question: "In the merge function you found, how are nested sections of config.local.json combined? Include that branch as an excerpt.",
   effort: 2
 })

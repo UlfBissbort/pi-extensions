@@ -17,18 +17,21 @@ export type InvestigationConfig = {
   provider: string; model: string; thinkingLevel: string; sessionId: string;
   workerPrompt: string; repositoryMapSource: string; repositoryMap: string;
   cwd: string; tools: ToolDeclaration[]; timestamp: number;
+  name?: string;                       // drawn by the host at launch; absent in older records
 };
 export type InvestigationRequest = {
   __type: 'ET.InvestigationRequest'; __uid: Uid;
   request: Record<string, unknown>; limits: Limits; timestamp: number;
 };
 export type HostInstruction = { __type: 'ET.HostInstruction'; __uid: Uid; content: string; timestamp: number };
+// A message the human user sent to this investigator while it was running.
+export type UserMessage = { __type: 'ET.UserMessage'; __uid: Uid; content: string; timestamp: number };
 export type LLMResponse = { __type: 'ET.LLMResponse'; __uid: Uid } & Omit<AssistantMessage, 'role'>;
 export type ToolResult = { __type: 'ET.ToolResult'; __uid: Uid } & Omit<ToolResultMessage, 'role'>;
 export type RunEndReason = 'submitted' | 'budget_exhausted' | 'cancelled' | 'error';
 export type RunEnded = { __type: 'ET.RunEnded'; __uid: Uid; reason: RunEndReason; message?: string; timestamp: number };
 
-export type Entry = InvestigationConfig | InvestigationRequest | HostInstruction | LLMResponse | ToolResult | RunEnded;
+export type Entry = InvestigationConfig | InvestigationRequest | HostInstruction | UserMessage | LLMResponse | ToolResult | RunEnded;
 export type InvestigationAgent = { __type: 'ET.InvestigationAgent'; __uid: Uid; context_: Entry[] };
 
 export const SUBMIT = 'submit_answer';
@@ -57,6 +60,8 @@ export function runLimits(agent: InvestigationAgent): Limits {
   if (start?.__type !== 'ET.InvestigationRequest') throw new Error('Agent has no active run');
   return start.limits;
 }
+export const agentName = (agent: InvestigationAgent): string | undefined => config(agent).name;
+export const userMessages = (entries: Entry[]) => entries.filter((e): e is UserMessage => e.__type === 'ET.UserMessage');
 export const responses = (entries: Entry[]) => entries.filter((e): e is LLMResponse => e.__type === 'ET.LLMResponse');
 export const turnsInRun = (agent: InvestigationAgent) => responses(currentRun(agent)).length;
 export const usage = (entries: Entry[]): Usage => responses(entries).reduce((u, r) => addUsage(u, r.usage), zeroUsage());
@@ -139,6 +144,7 @@ export function render(agent: InvestigationAgent): Context {
         break;
       }
       case 'ET.HostInstruction': messages.push({ role: 'user', content: [{ type: 'text', text: e.content }], timestamp: e.timestamp }); break;
+      case 'ET.UserMessage': messages.push({ role: 'user', content: [{ type: 'text', text: userMessageText(e.content) }], timestamp: e.timestamp }); break;
       case 'ET.LLMResponse': { const { __type, __uid, ...m } = e; messages.push({ role: 'assistant', ...m } as AssistantMessage); break; }
       case 'ET.ToolResult': { const { __type, __uid, ...m } = e; messages.push({ role: 'toolResult', ...m } as ToolResultMessage); break; }
       case 'ET.RunEnded': break;
@@ -150,5 +156,7 @@ export function render(agent: InvestigationAgent): Context {
 // Same text the session-based worker sent; the prefix originally kept user data
 // from being treated as an extension slash command.
 export const requestText = (request: Record<string, unknown>) => `Investigation request (task data):\n${JSON.stringify(request, null, 2)}`;
+export const userMessageText = (content: string) =>
+  `Message from the human user, sent to you while you were working. It takes precedence over the original request where they conflict; continue accordingly and finish with submit_answer.\n\n${content}`;
 export const continuationText = (request: Record<string, unknown>, limits: Limits) =>
   `The caller continues this investigation. Everything above is your own previous work; build on it rather than repeating it, and answer this follow-up with submit_answer. These limits replace the earlier ones.\n\n# Hard limits for this run\n${limitsText(limits)}\n\nFollow-up request (task data):\n${JSON.stringify(request, null, 2)}`;

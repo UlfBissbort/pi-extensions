@@ -19,6 +19,8 @@ type Effect = 'model' | 'tools' | 'record';
 
 export type RunState = {
   requestId: string; railIndex: number; phase: Phase; note?: string; model?: string;
+  name?: string;                       // the investigator's name, known from launch
+  inbox?: string[];                    // user messages not yet recorded; delivered before the next model call
   agent?: InvestigationAgent;          // the append-only record; source of truth for facts
   streaming?: StreamingContent;        // partial model response, not yet a fact
   awaiting?: Effect;                   // the effect the edge is performing for this run
@@ -30,6 +32,7 @@ export type RunEvent =
   | { type: 'started'; agent: InvestigationAgent }            // config and request recorded
   | { type: 'appended'; entries: Entry[] }                    // facts; a tool batch arrives at once
   | { type: 'streamed'; content: StreamingContent }
+  | { type: 'messaged'; content: string }                    // the user wrote to this investigator
   | { type: 'interrupted'; reason: RunEndReason; message: string }   // e.g. abort; the current effect may still finish
   | { type: 'failed'; reason: RunEndReason; message: string };       // the current effect threw
 
@@ -44,7 +47,8 @@ export type RunCommand =
   | { type: 'record'; drafts: EntryDraft[] }
   | { type: 'done' };
 
-export const initRun = (requestId: string, railIndex = 0): RunState => ({ requestId, railIndex, phase: 'queued' });
+export const initRun = (requestId: string, railIndex = 0, name?: string): RunState =>
+  ({ requestId, railIndex, phase: 'queued', ...(name === undefined ? {} : { name }) });
 
 const without = <T extends object, K extends keyof T>(value: T, ...keys: K[]): Omit<T, K> => {
   const copy = { ...value };
@@ -73,8 +77,15 @@ const awaiting = (commands: RunCommand[]): Effect | undefined => {
   const c = commands.find(c => c.type === 'callModel' || c.type === 'executeTools' || c.type === 'record');
   return c?.type === 'callModel' ? 'model' : c?.type === 'executeTools' ? 'tools' : c?.type === 'record' ? 'record' : undefined;
 };
-const proceed = (state: RunState): [RunState, RunCommand[]] => {
-  const commands = next(state);
+// User messages enter only at a turn boundary, right before the next model call,
+// so they never separate a response's tool calls from their results.
+const proceed = (prior: RunState): [RunState, RunCommand[]] => {
+  let state = prior;
+  let commands = next(state);
+  if (state.inbox?.length && commands[0]?.type === 'callModel') {
+    commands = [{ type: 'record', drafts: state.inbox.map(content => ({ __type: 'ET.UserMessage', content }) as EntryDraft) }];
+    state = without(state, 'inbox');
+  }
   const effect = awaiting(commands);
   return [effect ? { ...state, awaiting: effect } : without(state, 'awaiting'), [{ type: 'publish', throttle: false }, ...commands]];
 };
@@ -98,6 +109,12 @@ export function reduceRun(state: RunState, event: RunEvent): [RunState, RunComma
     }
     case 'streamed':
       return [{ ...state, streaming: event.content }, [{ type: 'publish', throttle: true }]];
+    case 'messaged': {
+      const queued = { ...state, inbox: [...state.inbox ?? [], event.content] };
+      // With an effect outstanding, the message waits for its outcome; otherwise (only
+      // before the run starts) it waits for the start.
+      return [queued, [{ type: 'publish', throttle: false }]];
+    }
     case 'interrupted': {
       if (state.stop) return [state, []];
       const stopped = { ...state, stop: { reason: event.reason, message: event.message } };
@@ -122,6 +139,7 @@ export type Step =
   | { id: StepId; kind: 'tool'; name: string; args: Record<string, unknown>; argumentsText: string; resultText?: string; outcome: Outcome; live: boolean; durationMs?: number }
   | { id: StepId; kind: 'submit'; answer: string; excerpts: number; outcome: Outcome; live: boolean; error?: string }
   | { id: StepId; kind: 'host'; text: string }
+  | { id: StepId; kind: 'user'; text: string }
   | { id: StepId; kind: 'end'; reason: RunEndReason; message?: string };
 
 // The terminal can show the model-visible text blocks. Never persist image data
@@ -169,6 +187,7 @@ export function steps(agent: InvestigationAgent | undefined, streaming?: Streami
         break;
       }
       case 'ET.HostInstruction': out.push({ id: e.__uid, kind: 'host', text: e.content }); break;
+      case 'ET.UserMessage': out.push({ id: e.__uid, kind: 'user', text: e.content }); break;
       case 'ET.RunEnded': out.push({ id: `run:${run}:end`, kind: 'end', reason: e.reason, ...(e.message === undefined ? {} : { message: e.message }) }); break;
     }
   }
@@ -181,7 +200,8 @@ export function steps(agent: InvestigationAgent | undefined, streaming?: Streami
 // display strings or the full record. Every step is retained in its original
 // order; only text within individual steps is shortened for the UI.
 export type Snapshot = {
-  requestId: string; railIndex: number; handle?: string;
+  requestId: string; railIndex: number; handle?: string; name?: string;
+  pendingMessages?: number;            // user messages waiting for the next turn
   phase: Phase; agentStatus?: AgentStatus; note?: string; model?: string;
   turns: number;
   steps: Step[];
@@ -197,7 +217,7 @@ const bounded = (text: string, max = MAX_STEP_TEXT) => text.length <= max
 function boundStep(s: Step): Step {
   switch (s.kind) {
     case 'request': return { ...s, question: bounded(s.question) };
-    case 'model': case 'host': return { ...s, text: bounded(s.text) };
+    case 'model': case 'host': case 'user': return { ...s, text: bounded(s.text) };
     case 'tool': return { ...s, args: Object.fromEntries(Object.entries(s.args).map(([k, v]) => [k, typeof v === 'string' ? bounded(v, MAX_ARG_TEXT) : v])), argumentsText: bounded(s.argumentsText), ...(s.resultText === undefined ? {} : { resultText: bounded(s.resultText) }) };
     case 'submit': return { ...s, answer: bounded(s.answer), ...(s.error === undefined ? {} : { error: bounded(s.error) }) };
     case 'end': return s.message === undefined ? s : { ...s, message: bounded(s.message) };
@@ -213,6 +233,8 @@ export function snapshot(state: RunState): Snapshot {
     steps: boundSteps(steps(agent, state.streaming)),
     turns: agent ? turnsInRun(agent) + (state.streaming ? 1 : 0) : 0,
     ...(agent ? { handle: `ET.InvestigationAgent('${agent.__uid}')`, agentStatus: status(agent) } : {}),
+    ...(state.name === undefined ? {} : { name: state.name }),
+    ...(state.inbox?.length ? { pendingMessages: state.inbox.length } : {}),
     ...(state.note === undefined ? {} : { note: state.note }),
     ...(state.model === undefined ? {} : { model: state.model }),
   };

@@ -376,20 +376,22 @@ test('extension results start with the agent handle, continue by handle, and rej
     const first = await tool.execute('a', { question: 'Start' }, undefined, undefined, { cwd: dir });
     const handle = first.details.agent;
     assert.match(handle, /^ET\.InvestigationAgent\('🍃-[0-9a-f]{20}'\)$/);
-    assert(first.content[0].text.startsWith(`${handle} answered\n\n<investigation_answer>`), first.content[0].text);
+    const name = first.details.name;
+    assert.match(name, /^[a-z]+(_[a-z]+)*$/);
+    assert(first.content[0].text.startsWith(`${name} = ${handle} answered\n\n<investigation_answer>`), first.content[0].text);
 
     const second = await tool.execute('b', { agent: handle, question: 'A follow-up' }, undefined, undefined, { cwd: dir });
     assert(!second.isError, second.content[0].text);
     assert.equal(second.details.agent, handle);
-    assert(second.content[0].text.startsWith(`${handle} answered\n\n`));
+    assert(second.content[0].text.startsWith(`${name} = ${handle} answered\n\n`));
+    assert.equal(second.details.name, name, 'a continued investigator keeps its name');
     assert(second.content[0].text.includes('Answer two'));
     assert(JSON.stringify(contexts.at(-1)).includes('Answer one'), 'the follow-up sees the first run');
     // The bare UID works too.
-    const uid = handle.match(/'(.*)'/)[1];
-    const slow = tool.execute('c', { agent: uid, question: 'A slow follow-up' }, undefined, undefined, { cwd: dir });
+    const slow = tool.execute('c', { agent: name, question: 'A slow follow-up' }, undefined, undefined, { cwd: dir });
     await new Promise(resolve => setTimeout(resolve, 30));
     const busy = await tool.execute('d', { agent: handle, question: 'Parallel follow-up' }, undefined, undefined, { cwd: dir });
-    assert(busy.isError); assert(busy.content[0].text.startsWith(`${handle} running\n\nNot started:`), busy.content[0].text);
+    assert(busy.isError); assert(busy.content[0].text.startsWith(`${name} = ${handle} running\n\nNot started:`), busy.content[0].text);
     assert.equal(busy.details.agentStatus, 'running');
     unblock();
     assert(!(await slow).isError);
@@ -397,7 +399,71 @@ test('extension results start with the agent handle, continue by handle, and rej
     const unknown = await tool.execute('e', { agent: "ET.InvestigationAgent('🍃-00000000000000000000')", question: 'x' }, undefined, undefined, { cwd: dir });
     assert(unknown.isError); assert.match(unknown.content[0].text, /^Investigation failed or incomplete: Unknown agent/);
     const invalid = await tool.execute('f', { agent: 'nonsense', question: 'x' }, undefined, undefined, { cwd: dir });
-    assert(invalid.isError); assert.match(invalid.content[0].text, /Invalid agent handle/);
+    assert(invalid.isError); assert.match(invalid.content[0].text, /Invalid agent: nonsense/);
+    const uid = handle.match(/'(.*)'/)[1];
+    const byUid = await tool.execute('g', { agent: uid, question: 'A follow-up by uid' }, undefined, undefined, { cwd: dir });
+    assert(!byUid.isError, byUid.content[0].text);
+    await handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('names are shown from launch, never reused, and @name messages reach the running investigator', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-names-'));
+  try {
+    const config = structuredClone(snapshot.config);
+    config.instructionsFile = join(root, 'prompts/worker.md');
+    config.parentPromptFile = join(root, 'prompts/parent.md');
+    config.repositoryMapFile = join(root, 'repository-map.md');
+    await writeFile(join(dir, 'config.json'), JSON.stringify(config));
+    const handlers = {}, tools = [], contexts = [], notes = [];
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    await registerInvestigation({ on: (name, fn) => handlers[name] = fn, registerTool: t => tools.push(t) }, dir, {
+      createRuntime: async () => scriptedRuntime(async (turn, context) => {
+        contexts.push(structuredClone(context));
+        if (JSON.stringify(context).includes('Wait for me')) {
+          if (turn === 0) { await gate; return [call('ls', { path: dir }, 'l1')]; }
+        }
+        return [submit('Done')];
+      }),
+    });
+    const ui = { notify: (text, level) => notes.push([level, text]), setWidget() {} };
+    // A name shown earlier in this session (e.g. before a reload) is never issued again.
+    const taken = 'hypatia_the_patient';
+    const entries = [{ type: 'message', message: { role: 'toolResult', toolName: 'investigate', details: { name: taken } } }];
+    await handlers.session_start({}, { hasUI: false, sessionManager: { getEntries: () => entries } });
+    const tool = tools[0];
+    const updates = [];
+    const pending = tool.execute('a', { question: 'Wait for me' }, undefined, u => updates.push(u), { cwd: dir, hasUI: true, ui });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const name = updates[0].details.snapshot.name;
+    assert(name && name !== taken, 'the name is known at launch, before the agent record exists');
+    const prefix = name.slice(0, name.length - 2);
+    const input = text => handlers.input({ type: 'input', text, source: 'interactive', streamingBehavior: 'steer' }, { hasUI: true, ui });
+    // Addressed by unique prefix with an ellipsis, while the first model request is still out.
+    assert.deepEqual(await input(`@${prefix}… look in the tests instead`), { action: 'handled' });
+    assert.match(notes.at(-1)[1], new RegExp(`^Sent to ${name}`));
+    assert.equal(updates.at(-1).details.snapshot.pendingMessages, 1);
+    assert.deepEqual(await input('@nobody_known hello'), { action: 'continue' }, 'unknown names are ordinary parent input');
+    assert.deepEqual(await input('no address here'), { action: 'continue' });
+    release();
+    const result = await pending;
+    assert(!result.isError, result.content[0].text);
+    // Delivered at the turn boundary: after the tool result, before the next model request.
+    const roles = contexts.at(-1).messages.map(m => m.role);
+    assert.deepEqual(roles.slice(-3), ['assistant', 'toolResult', 'user']);
+    assert.match(contexts.at(-1).messages.at(-1).content[0].text, /^Message from the human user[\s\S]*look in the tests instead$/);
+    const text = result.content[0].text;
+    assert(text.startsWith(`${name} = ${result.details.agent} answered\n\nThe user sent this investigator messages during this call`), text);
+    assert(text.includes('- "look in the tests instead"'));
+    assert(result.details.snapshot.steps.some(s => s.kind === 'user' && s.text === 'look in the tests instead'));
+    // Finished investigators cannot read messages; the user is told so.
+    assert.deepEqual(await input(`@${name} one more thing`), { action: 'handled' });
+    assert.match(notes.at(-1)[1], /is not running/);
+    // A parallel investigator gets a different name.
+    const other = await tool.execute('b', { question: 'Other' }, undefined, undefined, { cwd: dir });
+    assert.notEqual(other.details.name, name);
+    assert.notEqual(other.details.name, taken);
     await handlers.session_shutdown();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
