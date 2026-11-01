@@ -89,4 +89,4 @@ The package uses Pi's native `pi.extensions` manifest. Comparable public reposit
 
 ## License
 
-A license has not yet been selected. Public availability is not an open-source license grant; do not assume permission to redistribute or sublicense this code.
+MIT License. Copyright © 2026 Ulf Bissbort. See LICENSE for the full terms.

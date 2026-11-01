@@ -1,6 +1,7 @@
 {
   "name": "ulf-pi-extensions",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "A collection of Pi coding agent extensions",

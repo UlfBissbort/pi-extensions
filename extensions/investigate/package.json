@@ -1,6 +1,7 @@
 {
   "name": "ulf-pi-investigate",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "Isolated information gathering with exact source excerpts",
