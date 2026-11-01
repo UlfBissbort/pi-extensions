@@ -72,7 +72,7 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
   const failure = (agent: InvestigationAgent | undefined, message: string) =>
     Object.assign(new Error(message), agent ? { usage: usage(currentRun(agent)), turns: turnsInRun(agent), agent } : { usage: zeroUsage(), turns: 0 });
 
-  let model: Model<any>, level: string, tools: ExecutableTool[];
+  let model: Model<any>, level: string;
   try {
     signal.throwIfAborted();
     model = modelRuntime.getModel(config.provider, config.model)!;
@@ -101,7 +101,7 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
       return { content: [{ type: 'text', text: 'Answer accepted.' }], details: { submission: accepted, response } };
     },
   };
-  tools = [
+  const tools: ExecutableTool[] = [
     createReadTool(root), createGrepTool(root), createFindTool(root), createLsTool(root),
     ...(config.tools.allowBash ? [createBashTool(root)] : []),
   ].map(t => t as unknown as ExecutableTool).concat(submit);
