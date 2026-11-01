@@ -2,6 +2,7 @@
   "provider": "openai",
   "model": "gpt-6-luna",
   "thinkingLevel": "medium",
+  "handoff": { "timeoutSeconds": 60, "maxOutputTokens": 4096 },
   "instructionsFile": "./prompts/worker.md",
   "parentPromptFile": "./prompts/parent.md",
   "repositoryMapFile": "./repository-map.md",

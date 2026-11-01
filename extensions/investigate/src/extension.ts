@@ -1,16 +1,18 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { ModelRuntime, type ExtensionAPI, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import { loadConfig, loadWorkerContext } from './config.mjs';
 import { createSemaphore, limitsForEffort, normalizeRequest, zeroUsage } from './core.mjs';
 import { requestSchema, runInvestigation } from './worker.ts';
-import { snapshot as runSnapshot } from './run.ts';
+import { snapshot as runSnapshot, type RunState } from './run.ts';
+import { applyCommand, commandCompletion, parseAddressed, statusText, STOP_MESSAGE, HARD_STOP_MESSAGE, unreadStopped } from './addressed.ts';
+import { handoffDetails, handoffResultText } from './handoff.ts';
 import { createRunStore, type RunStore } from './store.ts';
 import { liveChain, renderInvestigationCall, renderInvestigationResult, renderReport, type ReportDetails } from './render.ts';
 import {
-  agentName, config as agentConfig, currentRun, lastRequest, railOf, status, userMessages,
+  agentName, config as agentConfig, currentRun, isUserStop, lastRequest, railOf, status, userMessages,
   type InvestigationAgent, type Uid,
 } from './agent.ts';
-import { addressToken, applyAddress, completeAddress, firstPart, NAMES, parseAddress, pickName, resolveName, type Candidate } from './names.ts';
+import { addressToken, applyAddress, completeAddress, firstPart, NAMES, pickName, resolveName, type Candidate } from './names.ts';
 import { setTui } from './scroll.ts';
 import { AGENT_ENTRY, delta, loadAgents } from './persist.ts';
 
@@ -72,6 +74,7 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
   const issued = new Set<string>();
   // Investigators that can receive user messages now, by name: from launch until their run ends.
   const running = new Map<string, RunStore>();
+  const finished = new Map<string, RunState>();
   const issueName = () => {
     const name = pickName(NAMES, issued, new Set([...running.keys()].map(firstPart)));
     issued.add(name);
@@ -114,20 +117,42 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     let release = () => {};
     try {
       const snapshot = await loadConfig(root);
+      store.admissionSignal.throwIfAborted();
       signal.throwIfAborted();
       const request = normalizeRequest(args, snapshot.config);
       const remaining = limitsForEffort(snapshot.config, request.effort).timeoutSeconds * 1000 - (Date.now() - started);
       if (remaining <= 0) throw new Error('Investigation deadline exceeded');
       timer = setTimeout(() => abort(new Error('Investigation deadline exceeded')), remaining);
       slots.setLimit(snapshot.config.limits.maxConcurrentInvestigations);
-      release = await slots.acquire(signal);
+      release = await slots.acquire(AbortSignal.any([signal, store.admissionSignal]));
+      store.admissionSignal.throwIfAborted();
       store.dispatch({ type: 'phase', phase: 'starting', model: `${snapshot.config.provider}/${snapshot.config.model}` });
+      store.admissionSignal.throwIfAborted();
       const modelRuntime = await dependencies.createRuntime(signal);
+      store.admissionSignal.throwIfAborted();
       // Re-read after admission: queued workers receive the current starting
       // instructions and repo skill, not the versions present before waiting.
       const freshSnapshot = { ...snapshot, ...await loadWorkerContext(root, snapshot.config) };
       signal.throwIfAborted();
+      store.admissionSignal.throwIfAborted();
       return await runInvestigation({ snapshot: freshSnapshot, request, cwd, signal, modelRuntime, store, agent: previous, name, railIndex, from });
+    } catch (error) {
+      if (isUserStop(store.state().stop?.reason) && !(error as Failure).agent) {
+        // Admission stopped before the worker could create its run. An existing
+        // investigator still records the stopped continuation for reload/status.
+        let agent = previous;
+        if (agent) {
+          const stamp = () => ({ __uid: `🍃-${randomBytes(10).toString('hex')}` as Uid, timestamp: Date.now() });
+          const snapshot = await loadConfig(root);
+          const request = normalizeRequest(args, snapshot.config);
+          agent = { ...agent, context_: [...agent.context_,
+            { __type: 'ET.InvestigationRequest', ...stamp(), request, limits: limitsForEffort(snapshot.config, request.effort), ...(from ? { from } : {}) },
+            { __type: 'ET.RunEnded', ...stamp(), reason: store.state().stop!.reason, message: store.state().stop!.message },
+          ] };
+        }
+        throw Object.assign(new Error(store.state().stop!.message), { agent, turns: 0, usage: zeroUsage() });
+      }
+      throw error;
     } finally {
       if (timer) clearTimeout(timer);
       release();
@@ -137,7 +162,12 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
   // Stop accepting user messages for this run and take those it did not read.
   // Synchronous, so no message can arrive in between.
   const takeLate = (name: string | undefined, store: RunStore) => {
-    if (name && running.get(name) === store) running.delete(name);
+    if (name && running.get(name) === store) {
+      running.delete(name);
+      finished.delete(name);
+      finished.set(name, store.state());
+      while (finished.size > MAX_AGENTS) finished.delete(finished.keys().next().value!);
+    }
     return store.state().inbox ?? [];
   };
 
@@ -176,7 +206,7 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
         late = takeLate(name, store);
         finalAgent = result.agent;
         store.dispatch({ type: 'phase', phase: 'completed' });
-        text = withHeader(result.agent, result.text, late);
+        text = withHeader(result.agent, result.text + (isUserStop(store.state().stop?.reason) ? unreadStopped(late) : ''), isUserStop(store.state().stop?.reason) ? [] : late);
         failed = false;
         usage = result.usage;
       } catch (error) {
@@ -184,7 +214,8 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
         late = takeLate(name, store);
         finalAgent = e.agent ?? agent;
         store.dispatch({ type: 'phase', phase: run.controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
-        text = withHeader(finalAgent, `Investigation failed or incomplete: ${e.message}`, late);
+        const stopped = isUserStop(store.state().stop?.reason);
+        text = withHeader(finalAgent, stopped ? handoffResultText(finalAgent, store.state().stop!.message) + unreadStopped(late) : `Investigation failed or incomplete: ${e.message}`, stopped ? [] : late);
         failed = true;
         usage = e.usage ?? usage;
       }
@@ -195,12 +226,12 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
       run.end();
       if (closed) return;
       const details: ReportDetails & Record<string, unknown> = {
-        requestId, snapshot: runSnapshot(store.state()), failed, elapsedMs: Date.now() - started, usage,
+        requestId, snapshot: runSnapshot(store.state()), failed, elapsedMs: Date.now() - started, usage, handoff: handoffDetails(finalAgent),
         agent: agentHandle(finalAgent), agentStatus: status(finalAgent), ...(name ? { name } : {}),
       };
       // To the parent: starts a turn when it is idle, follows its current run when busy.
       pi.sendMessage({ customType: REPORT, content: text, display: true, details }, { triggerTurn: true, deliverAs: 'followUp' });
-      if (late.length) resumeForUser(finalAgent, late);
+      if (late.length && !isUserStop(store.state().stop?.reason)) resumeForUser(finalAgent, late);
     })();
     return name;
   }
@@ -226,12 +257,16 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     target.addAutocompleteProvider(current => ({
       triggerCharacters: [...new Set([...(current.triggerCharacters ?? []), '@'])],
       async getSuggestions(lines, cursorLine, cursorCol, options) {
+        const commands = commandCompletion(lines, cursorLine, cursorCol, candidates().map(c => c.name));
+        if (commands) return commands;
         const token = addressToken(lines, cursorLine, cursorCol);
         const items = token === undefined ? [] : completeAddress(token, candidates());
         if (!items.length) return current.getSuggestions(lines, cursorLine, cursorCol, options);
         return { prefix: `@${token}`, items: items.map(c => ({ value: c.name, label: `@${c.name}`, description: c.description })) };
       },
       applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+        const commands = commandCompletion(lines, cursorLine, cursorCol, candidates().map(c => c.name));
+        if (commands?.prefix === prefix && commands.items.some(c => c.value === item.value && c.label === item.label)) return applyCommand(lines, cursorCol, item.value, prefix);
         const ours = addressToken(lines, cursorLine, cursorCol) !== undefined && item.label === `@${item.value}` && candidates().some(c => c.name === item.value);
         return ours ? applyAddress(lines, cursorCol, item.value) : current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
       },
@@ -274,8 +309,25 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
   pi.on('input', async (event, ctx) => {
     if (event.source === 'extension') return { action: 'continue' };
     if (ctx.hasUI) ui = ctx.ui;
-    const address = parseAddress(event.text);
+    const address = parseAddressed(event.text);
     if (!address) return { action: 'continue' };
+    if (address.kind === 'command') {
+      const target = resolveName(address.token, new Set([...issued, ...running.keys()]));
+      if (target.kind !== 'one') notify(target.kind === 'ambiguous' ? `@${address.token} matches ${target.names.join(', ')}; write more of the name.` : `Unknown investigator: @${address.token}.`, 'warning');
+      else if (address.error) notify(address.error, 'warning');
+      else {
+        const store = running.get(target.name);
+        const agent = byName(target.name);
+        if (address.command === 'status') notify(statusText(target.name, store?.state() ?? finished.get(target.name), agent, !!store), 'info');
+        else if (!store || (store.state().awaiting !== 'handoff' && store.state().agent && status(store.state().agent!) !== 'running')) notify('Not running.', 'info');
+        else {
+          const hard = address.command === 'stopp';
+          store.dispatch({ type: 'interrupted', reason: hard ? 'user_hard_stopped' : 'user_stopped', message: hard ? HARD_STOP_MESSAGE : STOP_MESSAGE });
+          notify(hard ? 'Stopping now.' : 'Stop requested.', 'info');
+        }
+      }
+      return { action: 'handled' };
+    }
     const target = resolveName(address.token, running.keys());
     if (target.kind === 'ambiguous') { notify(`@${address.token} matches ${target.names.join(', ')}; write more of the name.`, 'warning'); return { action: 'handled' }; }
     if (target.kind === 'one') {
@@ -367,10 +419,10 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
           reason => run.controller.abort(reason));
         const late = takeLate(name, store);
         keepAgent(result.agent);
-        if (late.length) resume = { agent: result.agent, late };
+        if (late.length && !isUserStop(store.state().stop?.reason)) resume = { agent: result.agent, late };
         store.dispatch({ type: 'phase', phase: 'completed' });
         return {
-          content: [{ type: 'text' as const, text: withHeader(result.agent, result.text, late) }],
+          content: [{ type: 'text' as const, text: withHeader(result.agent, result.text + (isUserStop(store.state().stop?.reason) ? unreadStopped(late) : ''), isUserStop(store.state().stop?.reason) ? [] : late) }],
           details: { requestId, snapshot: runSnapshot(store.state()), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0, agent: agentHandle(result.agent), ...(name ? { name } : {}), agentStatus: status(result.agent) },
           usage: result.usage,
         };
@@ -380,12 +432,13 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
         if (e.agent) keepAgent(e.agent);
         // A continuation that failed before its run started leaves the agent unchanged and still usable.
         const agent = e.agent ?? previous;
-        if (late.length && agent && !closed) resume = { agent, late };
+        const stopped = isUserStop(store.state().stop?.reason);
+        if (late.length && agent && !closed && !stopped) resume = { agent, late };
         else if (late.length) notify(`${name ?? 'The investigator'} stopped before it could read your message.`, 'warning');
         store.dispatch({ type: 'phase', phase: run.controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
         return {
-          content: [{ type: 'text' as const, text: withHeader(agent, `Investigation failed or incomplete: ${e.message}`, resume ? late : []) }],
-          details: { requestId, snapshot: runSnapshot(store.state()), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(name ? { name } : {}), ...(agent ? { agent: agentHandle(agent), agentStatus: status(agent) } : {}) },
+          content: [{ type: 'text' as const, text: withHeader(agent, stopped ? handoffResultText(agent, store.state().stop!.message) + unreadStopped(late) : `Investigation failed or incomplete: ${e.message}`, resume ? late : []) }],
+          details: { requestId, snapshot: runSnapshot(store.state()), handoff: handoffDetails(agent), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(name ? { name } : {}), ...(agent ? { agent: agentHandle(agent), agentStatus: status(agent) } : {}) },
           usage: e.usage ?? zeroUsage(), isError: true,
         };
       } finally {

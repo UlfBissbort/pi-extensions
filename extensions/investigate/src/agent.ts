@@ -30,10 +30,16 @@ export type HostInstruction = { __type: 'ET.HostInstruction'; __uid: Uid; conten
 export type UserMessage = { __type: 'ET.UserMessage'; __uid: Uid; content: string; timestamp: number };
 export type LLMResponse = { __type: 'ET.LLMResponse'; __uid: Uid } & Omit<AssistantMessage, 'role'>;
 export type ToolResult = { __type: 'ET.ToolResult'; __uid: Uid } & Omit<ToolResultMessage, 'role'>;
-export type RunEndReason = 'submitted' | 'budget_exhausted' | 'cancelled' | 'error';
-export type RunEnded = { __type: 'ET.RunEnded'; __uid: Uid; reason: RunEndReason; message?: string; timestamp: number };
+export type RunEndReason = 'submitted' | 'budget_exhausted' | 'cancelled' | 'user_stopped' | 'user_hard_stopped' | 'error';
+export const isUserStop = (reason?: RunEndReason) => reason === 'user_stopped' || reason === 'user_hard_stopped';
+export type RunEnded = { __type: 'ET.RunEnded'; __uid: Uid; reason: RunEndReason; message?: string; timestamp: number; partial?: AssistantMessage['content']; usage?: Usage; interruptedModel?: boolean };
+export type Handoff = {
+  __type: 'ET.Handoff'; __uid: Uid; timestamp: number;
+  trigger: '/stop' | '/stopp'; instruction: string; response?: AssistantMessage;
+  outcome: 'summary' | 'fallback'; text: string; usage: Usage; error?: string;
+};
 
-export type Entry = InvestigationConfig | InvestigationRequest | HostInstruction | UserMessage | LLMResponse | ToolResult | RunEnded;
+export type Entry = InvestigationConfig | InvestigationRequest | HostInstruction | UserMessage | LLMResponse | ToolResult | RunEnded | Handoff;
 export type InvestigationAgent = { __type: 'ET.InvestigationAgent'; __uid: Uid; context_: Entry[] };
 
 export const SUBMIT = 'submit_answer';
@@ -70,8 +76,10 @@ export function lastRequest(agent: InvestigationAgent): InvestigationRequest | u
 }
 export const userMessages = (entries: Entry[]) => entries.filter((e): e is UserMessage => e.__type === 'ET.UserMessage');
 export const responses = (entries: Entry[]) => entries.filter((e): e is LLMResponse => e.__type === 'ET.LLMResponse');
-export const turnsInRun = (agent: InvestigationAgent) => responses(currentRun(agent)).length;
-export const usage = (entries: Entry[]): Usage => responses(entries).reduce((u, r) => addUsage(u, r.usage), zeroUsage());
+export const turnsInRun = (agent: InvestigationAgent) => currentRun(agent).reduce((n, e) => n + (e.__type === 'ET.LLMResponse' || (e.__type === 'ET.RunEnded' && e.interruptedModel) ? 1 : 0), 0);
+export const usage = (entries: Entry[]): Usage => entries.reduce((u, e) =>
+  'usage' in e && e.usage ? addUsage(u, e.usage) : u, zeroUsage());
+export const handoffOf = (agent?: InvestigationAgent): Handoff | undefined => agent && currentRun(agent).find((e): e is Handoff => e.__type === 'ET.Handoff');
 export const toolCalls = (response: LLMResponse): ToolCall[] =>
   response.content.filter((b): b is ToolCall => b.type === 'toolCall');
 
@@ -83,7 +91,7 @@ export function acceptedSubmission(agent: InvestigationAgent): Submission | unde
 
 export type AgentStatus = 'running' | 'answered' | 'resumable' | 'empty';
 export function status(agent: InvestigationAgent): AgentStatus {
-  const last = agent.context_.at(-1);
+  const last = [...agent.context_].reverse().find(e => e.__type !== 'ET.Handoff');
   if (!last) return 'empty';
   if (last.__type !== 'ET.RunEnded') return 'running';
   return last.reason === 'submitted' ? 'answered' : 'resumable';
@@ -155,7 +163,33 @@ export function render(agent: InvestigationAgent): Context {
       case 'ET.UserMessage': messages.push({ role: 'user', content: [{ type: 'text', text: userMessageText(e.content) }], timestamp: e.timestamp }); break;
       case 'ET.LLMResponse': { const { __type, __uid, ...m } = e; messages.push({ role: 'assistant', ...m } as AssistantMessage); break; }
       case 'ET.ToolResult': { const { __type, __uid, ...m } = e; messages.push({ role: 'toolResult', ...m } as ToolResultMessage); break; }
-      case 'ET.RunEnded': break;
+      case 'ET.Handoff': {
+        messages.push({ role: 'user', content: [{ type: 'text', text: e.instruction }], timestamp: e.timestamp });
+        // Persist the actual response, closing any proposed calls without executing them.
+        // This keeps the next continuation's prefix identical to the handoff exchange.
+        if (e.response && e.response.stopReason !== 'aborted' && e.response.stopReason !== 'error') {
+          messages.push(e.response);
+          for (const call of e.response.content.filter((b): b is ToolCall => b.type === 'toolCall')) messages.push({
+            role: 'toolResult', toolCallId: call.id, toolName: call.name,
+            content: [{ type: 'text', text: call.name === SUBMIT ? 'Handoff recorded; no excerpts were fetched.' : 'Not executed: reporting only.' }],
+            isError: call.name !== SUBMIT, timestamp: e.timestamp,
+          } as ToolResultMessage);
+        } else messages.push({ role: 'user', content: [{ type: 'text', text: `Host-generated handoff fallback:\n${e.text}` }], timestamp: e.timestamp });
+        break;
+      }
+      case 'ET.RunEnded': {
+        // A graceful stop can leave proposed calls unexecuted. Close those calls
+        // in the model projection when resuming, without inventing recorded work.
+        const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant') as AssistantMessage | undefined;
+        for (const call of lastAssistant?.content.filter((b): b is ToolCall => b.type === 'toolCall') ?? []) {
+          if (!messages.slice(messages.lastIndexOf(lastAssistant!) + 1).some(m => m.role === 'toolResult' && m.toolCallId === call.id)) messages.push({
+            role: 'toolResult', toolCallId: call.id, toolName: call.name,
+            content: [{ type: 'text', text: 'Not executed: the investigation ended before this tool batch started.' }],
+            isError: true, timestamp: e.timestamp,
+          } as ToolResultMessage);
+        }
+        break;
+      }
     }
   }
   return { messages };

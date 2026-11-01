@@ -7,10 +7,11 @@ import {
   type ModelRuntime, type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
 import { assembleResponse, limitsForEffort, validateSubmission, zeroUsage } from './core.mjs';
+import { activityLog, handoffContext, handoffInstruction, summaryText } from './handoff.ts';
 import type { EntryDraft, RunCommand, RunEvent } from './run.ts';
 import { createRunStore, type RunStore } from './store.ts';
 import {
-  acceptedSubmission, config as agentConfig, currentRun, SUBMIT, turnsInRun, usage,
+  acceptedSubmission, config as agentConfig, currentRun, handoffOf, SUBMIT, turnsInRun, usage,
   type Entry, type InvestigationAgent, type LLMResponse, type ToolDeclaration, type ToolResult, type Uid,
 } from './agent.ts';
 
@@ -76,6 +77,7 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
     ? { ...snapshot.config, provider: kept.provider, model: kept.model, thinkingLevel: kept.thinkingLevel, tools: { ...snapshot.config.tools, allowBash: kept.tools.some(t => t.name === 'bash') } }
     : snapshot.config;
   const limits = limitsForEffort(config, request.effort ?? config.defaults.effort);
+  const researchSignal = AbortSignal.any([signal, store.signalFor('research')]);
   const abortMessage = () => String(signal.reason?.message ?? signal.reason ?? 'Investigation cancelled');
   const failure = (agent: InvestigationAgent | undefined, message: string) =>
     Object.assign(new Error(message), agent ? { usage: usage(currentRun(agent)), turns: turnsInRun(agent), agent } : { usage: zeroUsage(), turns: 0 });
@@ -85,7 +87,8 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
     signal.throwIfAborted();
     model = modelRuntime.getModel(config.provider, config.model)!;
     if (!model) throw new Error(`Unknown investigator model: ${config.provider}/${config.model}`);
-    const available = await modelRuntime.getAvailable(config.provider, { signal });
+    const available = await modelRuntime.getAvailable(config.provider, { signal: AbortSignal.any([signal, store.admissionSignal]) });
+    store.admissionSignal.throwIfAborted();
     signal.throwIfAborted();
     if (!available.some(m => m.id === model.id && m.provider === model.provider)) throw new Error(`No available credentials for ${config.provider}/${config.model}`);
     level = config.thinkingLevel;
@@ -119,7 +122,7 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
 
   const callModel = async (context: Context, sessionId: string): Promise<LLMResponse> => {
     const stream = modelRuntime.streamSimple(model, context, {
-      reasoning: level === 'off' ? undefined : level, sessionId, signal,
+      reasoning: level === 'off' ? undefined : level, sessionId, signal: researchSignal,
       transport: 'auto', timeoutMs: 300000, maxRetries: 0, maxRetryDelayMs: 60000,
     } as any);
     for await (const event of stream) {
@@ -143,18 +146,57 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
     try {
-      const out = await byName.get(call.name)!.execute(call.id, args, signal);
+      researchSignal.throwIfAborted();
+      const out = await byName.get(call.name)!.execute(call.id, args, researchSignal);
       const details = out.details === undefined ? {} : { details: out.details };
       return { ...base, content: out.content, ...details, isError: false, durationMs: elapsed(), timestamp: Date.now() } as ToolResult;
     } catch (error) {
       return { ...base, content: errorText(error), details: {}, isError: true, durationMs: elapsed(), timestamp: Date.now() };
     }
   };
+  const handoff = async (command: Extract<RunCommand, { type: 'handoff' }>): Promise<Entry> => {
+    const instruction = handoffInstruction(command.agent, command.trigger);
+    const timestamp = Date.now();
+    const settings = config.handoff ?? { timeoutSeconds: 60, maxOutputTokens: 4096 };
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new Error('Handoff deadline exceeded')), settings.timeoutSeconds * 1000);
+    const handoffSignal = AbortSignal.any([signal, store.signalFor('handoff'), timeout.signal]);
+    let response: import('@earendil-works/pi-ai').AssistantMessage | undefined;
+    try {
+      handoffSignal.throwIfAborted();
+      const stream = modelRuntime.streamSimple(model, handoffContext(command.agent, instruction, timestamp), {
+        reasoning: level === 'off' ? undefined : level, sessionId: agentConfig(command.agent).sessionId,
+        signal: handoffSignal, transport: 'auto', timeoutMs: settings.timeoutSeconds * 1000,
+        maxTokens: settings.maxOutputTokens, maxRetries: 0, maxRetryDelayMs: 60000,
+      } as any);
+      // No execution loop: model-proposed tools cannot run during reporting.
+      for await (const _event of stream) { /* consume the bounded reporting response */ }
+      response = await stream.result();
+      handoffSignal.throwIfAborted();
+      const text = summaryText(response);
+      if (!text) throw new Error(response.errorMessage || 'No usable handoff text returned');
+      return { __type: 'ET.Handoff', __uid: newUid(), timestamp, trigger: command.trigger, instruction,
+        response, outcome: 'summary', text, usage: response.usage };
+    } catch (error) {
+      return { __type: 'ET.Handoff', __uid: newUid(), timestamp, trigger: command.trigger, instruction,
+        ...(response ? { response } : {}), outcome: 'fallback', text: activityLog(command.agent),
+        usage: response?.usage ?? zeroUsage(), error: String((error as Error).message ?? error) };
+    } finally { clearTimeout(timer); }
+  };
   // Each effect yields exactly one event. Calls in a batch run concurrently; their
   // results are recorded together, in call order.
   const perform = async (command: RunCommand): Promise<RunEvent> => {
     switch (command.type) {
-      case 'callModel': return { type: 'appended', entries: [await callModel(command.context, command.sessionId)] };
+      case 'callModel': {
+        dispatch({ type: 'model_started' });
+        const response = await callModel(command.context, command.sessionId);
+        if (response.stopReason === 'aborted' || researchSignal.aborted) {
+          if (response.content.length) dispatch({ type: 'streamed', content: response.content });
+          return { type: 'failed', reason: 'cancelled', message: String(researchSignal.reason ?? 'Model request interrupted'), usage: response.usage };
+        }
+        return { type: 'appended', entries: [response] };
+      }
+      case 'handoff': return { type: 'appended', entries: [await handoff(command)] };
       case 'executeTools': return { type: 'appended', entries: await Promise.all(command.calls.map(runTool)) };
       case 'record': return { type: 'appended', entries: command.drafts.map(stamp) };
       default: throw new Error(`Not an effect: ${command.type}`);
@@ -181,6 +223,12 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
     if (signal.aborted) interrupt();
     for (let command = queue.shift(); command && command.type !== 'done'; command = queue.shift()) {
       let event: RunEvent;
+      const stop = store.state().stop;
+      if (stop && (command.type === 'callModel' || command.type === 'executeTools')) {
+        dispatch({ type: 'failed', ...stop });
+        continue;
+      }
+      if (stop && command.type === 'record') command = { ...command, drafts: command.drafts.map(d => d.__type === 'ET.RunEnded' && !acceptedSubmission(store.state().agent!) ? { ...d, ...stop } : d) };
       try { event = await perform(command); } catch (error) {
         event = signal.aborted
           ? { type: 'failed', reason: 'cancelled', message: abortMessage() }
@@ -193,9 +241,9 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
   }
 
   const agent = store.state().agent!;
-  const ended = agent.context_.at(-1);
+  const ended = [...currentRun(agent)].reverse().find(e => e.__type === 'ET.RunEnded');
   if (ended?.__type !== 'ET.RunEnded') throw failure(agent, 'Investigation stopped without ending its run');
-  if (ended.reason !== 'submitted') throw failure(agent, ended.message ?? `Investigation ended: ${ended.reason}`);
+  if (ended.reason !== 'submitted') throw Object.assign(failure(agent, ended.message ?? `Investigation ended: ${ended.reason}`), { handoff: handoffOf(agent) });
   const response = acceptedSubmission(agent)!;
   return { ...response, usage: usage(currentRun(agent)), turns: turnsInRun(agent), model: `${model.provider}/${model.id}`, agent };
 }

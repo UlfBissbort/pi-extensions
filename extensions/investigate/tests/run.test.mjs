@@ -24,6 +24,31 @@ const agent = { ...started, context_: [...started.context_,
   { __type: 'ET.RunEnded', __uid: u(8), reason: 'submitted', timestamp: 8 },
 ] };
 
+test('user stop survives start and preserves outstanding model, tools, and submission facts', () => {
+  const stop = { type: 'interrupted', reason: 'user_stopped', message: 'Stopped by the user' };
+  let [queued] = reduceRun(initRun('q'), stop);
+  let [state, commands] = reduceRun(queued, { type: 'started', agent: started });
+  assert.equal(commands.at(-1).type, 'record');
+  assert.equal(commands.at(-1).drafts[0].reason, 'user_stopped');
+  for (const tool of ['read', 'submit_answer']) {
+    [state] = reduceRun(initRun(tool), { type: 'started', agent: started });
+    [state] = reduceRun(state, { type: 'appended', entries: [response(3, [call(tool, {}, 'a')])] });
+    assert.equal(state.awaiting, 'tools');
+    [state, commands] = reduceRun(state, stop);
+    assert.deepEqual(commands.map(c => c.type), ['publish']);
+    const again = reduceRun(state, stop);
+    assert.deepEqual(again, [state, []]);
+    [state] = reduceRun(state, { type: 'messaged', content: 'unread' });
+    [state, commands] = reduceRun(state, { type: 'appended', entries: [{ ...result(4, 'a', tool), details: tool === 'submit_answer' ? { response: submitted } : {} }] });
+    assert.equal(state.agent.context_.at(-1).__type, 'ET.ToolResult');
+    assert.equal(commands.at(-1).drafts[0].reason, tool === 'submit_answer' ? 'submitted' : 'user_stopped');
+    assert.deepEqual(state.inbox, ['unread']);
+    [state, commands] = reduceRun(state, { type: 'appended', entries: commands.at(-1).drafts.map(d => ({ ...d, __uid: u(5), timestamp: 5 })) });
+    assert.equal(status(state.agent), tool === 'submit_answer' ? 'answered' : 'resumable');
+    assert.equal(commands.at(-1).type, tool === 'submit_answer' ? 'done' : 'handoff');
+  }
+});
+
 test('steps are a pure, private view of the record with ids from what each step is', () => {
   const s = steps(agent);
   assert.deepEqual(s.map(x => [x.id, x.kind, x.outcome ?? x.reason ?? null]), [
@@ -146,7 +171,7 @@ test('the reducer runs the whole worker loop as data', () => {
 
 test('an interruption waits for the outstanding effect, records it, then ends the run', () => {
   const { state, log } = drive([[call('ls', {}, 'a')], [call('ls', {}, 'b')]], { interruptAt: 1 });
-  assert.deepEqual(log.find(([type]) => type === 'interrupted'), ['interrupted', []], 'nothing new while the model call is outstanding');
+  assert.deepEqual(log.find(([type]) => type === 'interrupted'), ['interrupted', ['publish']], 'only UI publication while the model call is outstanding');
   assert.deepEqual(state.agent.context_.slice(2).map(e => e.__type), ['ET.LLMResponse', 'ET.ToolResult', 'ET.LLMResponse', 'ET.RunEnded']);
   assert.deepEqual([state.agent.context_.at(-1).reason, state.agent.context_.at(-1).message], ['cancelled', 'stop']);
   // With nothing outstanding, the stop applies at once.
@@ -154,8 +179,8 @@ test('an interruption waits for the outstanding effect, records it, then ends th
   assert.equal(idle.awaiting, 'record');
   assert.deepEqual(commands.at(-1), { type: 'record', drafts: [{ __type: 'ET.RunEnded', reason: 'cancelled', message: 'now' }] });
   // A failed effect ends the run with its error.
-  const [, afterFailure] = reduceRun({ ...initRun('r'), agent: started, awaiting: 'model' }, { type: 'failed', reason: 'error', message: 'boom' });
-  assert.deepEqual(afterFailure.at(-1).drafts, [{ __type: 'ET.RunEnded', reason: 'error', message: 'boom' }]);
+  const [, afterFailure] = reduceRun({ ...initRun('r'), agent: started, awaiting: 'model', modelActive: true }, { type: 'failed', reason: 'error', message: 'boom' });
+  assert.deepEqual(afterFailure.at(-1).drafts, [{ __type: 'ET.RunEnded', reason: 'error', message: 'boom', interruptedModel: true }]);
 });
 
 test('streaming is throttled and a recorded response replaces it', () => {

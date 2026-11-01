@@ -448,6 +448,398 @@ async function extensionHarness(dir, script, session = []) {
   return h;
 }
 const lastUserText = context => context.messages.at(-1).content[0].text;
+const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+
+test('addressed stop settles an in-flight model, reports unread messages, and never auto-resumes either owner', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-stop-'));
+  try {
+    let gate = deferred(), entered = deferred(), hold = false, signal;
+    const h = await extensionHarness(dir, async (_turn, _context, options) => {
+      signal = options.signal;
+      if (hold) { entered.resolve(); await gate.promise; }
+      return [submit('An answer')];
+    });
+    await h.start();
+    const first = await h.tools[0].execute('first', { question: 'start' }, undefined, undefined, h.ctx);
+    const name = first.details.name;
+    hold = true;
+    const pending = h.tools[0].execute('second', { agent: name, question: 'continue' }, undefined, undefined, h.ctx);
+    await entered.promise;
+    const count = h.contexts.length;
+    await h.input(`@${name} /status`);
+    assert.match(h.notes.at(-1)[1], /running.*1 model requests.*model/);
+    assert.equal(h.contexts.length, count);
+    await h.input(`@${name} unread message`);
+    await h.input(`@${name} /stop extra`);
+    assert.match(h.notes.at(-1)[1], /Usage/);
+    await h.input(`@${name} /stop`);
+    await h.input(`@${name} /stop`);
+    assert.equal(signal.aborted, false);
+    await h.input(`@${name} /status`);
+    assert.match(h.notes.at(-1)[1], /stopping.*unread: 1/);
+    gate.resolve();
+    const stopped = await pending;
+    assert.match(stopped.content[0].text, /Stopped by the user/);
+    assert.match(stopped.content[0].text, /not read.*will not automatically/);
+    assert.equal(stopped.details.agentStatus, 'resumable');
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.contexts.length, count + 1, 'one reporting call, no further research');
+    assert.equal(stopped.details.handoff.outcome, 'summary');
+    await h.input(`@${name} /stop`);
+    assert.match(h.notes.at(-1)[1], /Not running/);
+    gate = deferred(); entered = deferred();
+    const report = h.nextMessage();
+    await h.input(`@${name} explicitly resume`);
+    await entered.promise;
+    assert.match(JSON.stringify(h.contexts.at(-1)), /Not executed: the investigation ended/);
+    await h.input(`@${name} another unread message`);
+    await h.input(`@${name} /stop`);
+    assert.equal(signal.aborted, false);
+    gate.resolve();
+    const sent = await report;
+    assert.match(sent.message.content, /Stopped by the user/);
+    assert.match(sent.message.content, /another unread message/);
+    assert.doesNotMatch(sent.message.content, /continues with them now/);
+    assert.equal(sent.message.details.agentStatus, 'resumable');
+    await new Promise(r => setTimeout(r, 20));
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.contexts.length, count + 3, 'resumed research and its handoff');
+    // Persisted agent deltas retain the explicit stopping reason.
+    assert.match(JSON.stringify(h.session), /user_stopped/);
+    for (const text of ['@unknown /stop', '@unknown /oops']) assert.deepEqual(await h.input(text), { action: 'handled' });
+    await h.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('stop racing accepted submission returns the real answer without a handoff', async () => {
+  const { createRunStore } = await jiti.import('../src/store.ts');
+  let requested = false;
+  const store = createRunStore('submission', view => {
+    if (!requested && view.steps.some(s => s.kind === 'submit' && s.outcome === 'ok')) {
+      requested = true;
+      store.dispatch({ type: 'interrupted', reason: 'user_stopped', message: 'Stopped by the user' });
+    }
+  });
+  const capture = [];
+  const result = await run(await scriptedRuntime(() => [submit('retained answer')], capture), { store });
+  assert.equal(result.agent.context_.at(-1).reason, 'submitted');
+  assert.match(result.text, /retained answer/);
+  assert.equal(capture.length, 1);
+  store.close();
+});
+
+test('graceful stop lets an executing shell tool finish then hands off without executing more tools', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-tool-stop-'));
+  try {
+    const { createRunStore } = await jiti.import('../src/store.ts');
+    const { access } = await import('node:fs/promises');
+    const marker = join(dir, 'started');
+    const store = createRunStore('tools');
+    const controller = new AbortController();
+    const capture = [];
+    const runtime = await scriptedRuntime(() => [call('bash', { command: `touch '${marker}'; sleep 0.15; echo completed` })], capture);
+    const config = structuredClone(snapshot); config.config.tools.allowBash = true;
+    const pending = run(runtime, { snapshot: config, store, signal: controller.signal });
+    const rejected = assert.rejects(pending, error => {
+      assert.match(error.message, /Stopped by the user/);
+      const result = error.agent.context_.find(e => e.__type === 'ET.ToolResult');
+      assert.match(JSON.stringify(result.content), /completed/);
+      assert.equal(result.isError, false);
+      assert.equal(error.agent.context_.at(-2).reason, 'user_stopped');
+      assert.equal(error.agent.context_.at(-1).__type, 'ET.Handoff');
+      assert.equal(error.agent.context_.at(-1).outcome, 'fallback', 'reporting tool call is not executed');
+      return true;
+    });
+    for (let n = 0; ; n++) {
+      try { await access(marker); break; } catch { if (n > 200) throw new Error('Tool did not start'); await new Promise(r => setTimeout(r, 5)); }
+    }
+    store.dispatch({ type: 'interrupted', reason: 'user_stopped', message: 'Stopped by the user' });
+    assert.equal(controller.signal.aborted, false);
+    await rejected;
+    assert.equal(capture.length, 2);
+    store.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('queued stop prevents runtime creation and starting stop prevents model work', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-admission-stop-'));
+  try {
+    const gate = deferred(), entered = deferred();
+    const h = await extensionHarness(dir, async () => { entered.resolve(); await gate.promise; return [submit('ok')]; });
+    const config = JSON.parse(await (await import('node:fs/promises')).readFile(join(dir, 'config.json'), 'utf8'));
+    config.limits.maxConcurrentInvestigations = 1;
+    await writeFile(join(dir, 'config.json'), JSON.stringify(config));
+    const first = h.tools[0].execute('a', { question: 'occupy slot' }, undefined, undefined, h.ctx);
+    await entered.promise;
+    let queuedName;
+    const queued = h.tools[0].execute('b', { question: 'queued' }, undefined, update => { queuedName = update.details.snapshot.name; }, h.ctx);
+    assert(queuedName);
+    await h.input(`@${queuedName} pending`);
+    await h.input(`@${queuedName} /stop`);
+    const stopped = await queued;
+    assert.match(stopped.content[0].text, /Stopped by the user/);
+    assert.match(stopped.content[0].text, /pending/);
+    assert.equal(h.contexts.length, 1);
+    gate.resolve(); await first;
+    // Stop synchronously on starting publication: no runtime/model should start.
+    let stopping;
+    const starting = await h.tools[0].execute('c', { question: 'stop at starting' }, undefined, update => {
+      const s = update.details.snapshot;
+      if (s.phase === 'starting' && !stopping) stopping = h.input(`@${s.name} /stop`);
+    }, h.ctx);
+    assert.match(starting.content[0].text, /Stopped by the user/);
+    assert.equal(h.contexts.length, 1);
+    await h.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+const { HANDOFF_MARKER } = await jiti.import('../src/handoff.ts');
+const isHandoff = context => lastUserText(context).includes(HANDOFF_MARKER);
+const waitAbort = signal => new Promise((_, reject) => {
+  if (signal.aborted) reject(signal.reason);
+  else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+});
+
+for (const hard of [false, true]) test(`${hard ? 'hard' : 'soft'} stop preserves the exact request prefix and cache-affinity settings for handoff`, async () => {
+  const { createRunStore } = await jiti.import('../src/store.ts');
+  const { status, handoffOf } = await jiti.import('../src/agent.ts');
+  const entered = deferred(), gate = deferred(), capture = [];
+  const store = createRunStore('cache');
+  const runtime = await scriptedRuntime(async (turn, context, options) => {
+    if (isHandoff(context)) return [{ type: 'text', text: 'Verified: inspected the directory. Still unfinished.' }];
+    if (turn === 0) return [call('ls', { path: root }, 'listing')];
+    entered.resolve();
+    if (hard) return await waitAbort(options.signal);
+    await gate.promise;
+    return [call('bash', { command: 'must never execute' }, 'not-run')];
+  }, capture);
+  const pending = run(runtime, { store });
+  const rejected = assert.rejects(pending, error => {
+    const h = handoffOf(error.agent);
+    assert.equal(h.outcome, 'summary');
+    assert.equal(h.trigger, hard ? '/stopp' : '/stop');
+    assert.equal(status(error.agent), 'resumable');
+    assert.equal(error.usage.input, hard ? 20 : 30, 'reporting usage is included');
+    assert.equal(error.agent.context_.filter(e => e.__type === 'ET.ToolResult').length, 1);
+    // Persistence must retain both the summary and exact reporting request for future resume.
+    const restored = JSON.parse(JSON.stringify(error.agent));
+    const rendered = render(restored);
+    assert.deepEqual(rendered.messages.slice(0, capture[2].context.messages.length), capture[2].context.messages);
+    assert.match(JSON.stringify(rendered), /Verified: inspected/);
+    return true;
+  });
+  await entered.promise;
+  // Include a partial that the scripted provider will not return in its abort result.
+  if (hard) store.dispatch({ type: 'streamed', content: [{ type: 'text', text: 'partial observation' }, { type: 'thinking', thinking: 'PRIVATE_REASONING' }] });
+  store.dispatch({ type: 'interrupted', reason: hard ? 'user_hard_stopped' : 'user_stopped', message: hard ? 'Hard-stopped by the user' : 'Stopped by the user' });
+  gate.resolve();
+  await rejected;
+  assert.equal(capture.length, 3, 'two research calls and one reporting call');
+  const research = capture[1], report = capture[2];
+  assert.deepEqual(report.context.messages.slice(0, research.context.messages.length), research.context.messages);
+  assert.deepEqual(report.context.messages[0], research.context.messages[0], 'system and tools stay unchanged');
+  assert.equal(report.selected, research.selected);
+  for (const key of ['sessionId', 'reasoning', 'transport']) assert.equal(report.options[key], research.options[key]);
+  assert.equal(report.options.toolChoice, undefined);
+  assert.equal(report.options.signal.aborted, false, 'the reporting signal is independent of research cancellation');
+  if (hard) {
+    assert.match(lastUserText(report.context), /partial observation/);
+    assert.doesNotMatch(lastUserText(report.context), /PRIVATE_REASONING/);
+    assert(report.context.messages.every(m => m.stopReason !== 'aborted'));
+  }
+  store.close();
+});
+
+for (const failure of ['error', 'timeout', 'hard-stop']) test(`handoff ${failure} produces a deterministic fallback without retries`, async () => {
+  const { createRunStore } = await jiti.import('../src/store.ts');
+  const store = createRunStore('fallback');
+  const entered = deferred(), reporting = deferred(), gate = deferred(), capture = [];
+  const runtime = await scriptedRuntime(async (_turn, context, options) => {
+    if (isHandoff(context)) {
+      reporting.resolve();
+      if (failure === 'error') throw new Error('provider unavailable');
+      return await waitAbort(options.signal);
+    }
+    entered.resolve(); await gate.promise;
+    return [call('ls', { path: root })];
+  }, capture);
+  const config = structuredClone(snapshot);
+  config.config.handoff = { timeoutSeconds: 0.03, maxOutputTokens: 100 };
+  const pending = run(runtime, { store, snapshot: config });
+  const rejected = assert.rejects(pending, error => {
+    const h = error.agent.context_.at(-1);
+    assert.equal(h.__type, 'ET.Handoff');
+    assert.equal(h.outcome, 'fallback');
+    assert.match(h.text, /Activity log/);
+    assert.match(h.text, /not executed/);
+    return true;
+  });
+  await entered.promise;
+  store.dispatch({ type: 'interrupted', reason: 'user_stopped', message: 'Stopped by the user' });
+  gate.resolve(); await reporting.promise;
+  assert.equal(store.state().phase, 'handing_off');
+  if (failure === 'hard-stop') store.dispatch({ type: 'interrupted', reason: 'user_hard_stopped', message: 'Hard-stopped by the user' });
+  await rejected;
+  assert.equal(capture.length, 2);
+  store.close();
+});
+
+test('/stopp routes to only the selected run and unread messages never restart it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-hard-stop-'));
+  try {
+    const research = deferred(), reporting = deferred(), release = deferred();
+    const h = await extensionHarness(dir, async (_turn, context, options) => {
+      if (isHandoff(context)) { reporting.resolve(); await release.promise; return [{ type: 'text', text: 'Partial handoff' }]; }
+      research.resolve(); return await waitAbort(options.signal);
+    });
+    await h.start();
+    let name;
+    const pending = h.tools[0].execute('hard', { question: 'interrupted task' }, undefined, u => { name = u.details.snapshot.name; }, h.ctx);
+    await research.promise;
+    await h.input(`@${name} /stop`);
+    await h.input(`@${name} /stopp`);
+    await reporting.promise;
+    await h.input(`@${name} /status`);
+    assert.match(h.notes.at(-1)[1], /handing off/);
+    await h.input(`@${name} unread during reporting`);
+    release.resolve();
+    const result = await pending;
+    assert.match(result.content[0].text, /Hard-stopped by the user with \/stopp/);
+    assert.match(result.content[0].text, /Partial handoff/);
+    assert.match(result.content[0].text, /unread during reporting/);
+    assert.equal(result.details.handoff.outcome, 'summary');
+    assert.equal(h.contexts.length, 2);
+    assert.equal(h.sent.length, 0);
+    await h.handlers.session_shutdown();
+    const restored = await extensionHarness(dir, async (_turn, context) => {
+      assert.match(JSON.stringify(context), /Partial handoff/);
+      return [submit('resumed')];
+    }, h.session);
+    await restored.start();
+    const result2 = await restored.tools[0].execute('resume', { agent: name, question: 'resume explicitly' }, undefined, undefined, restored.ctx);
+    assert(!result2.isError);
+    await restored.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('handoff uses a retained investigator model even when global configuration changes', async () => {
+  const { createRunStore } = await jiti.import('../src/store.ts');
+  const first = await run(await scriptedRuntime(() => [submit('prior answer')]));
+  const changed = structuredClone(snapshot);
+  changed.config.model = 'not-the-retained-model';
+  changed.config.thinkingLevel = 'off';
+  const entered = deferred(), gate = deferred(), capture = [];
+  const runtime = await scriptedRuntime(async (_turn, context) => {
+    if (isHandoff(context)) return [{ type: 'text', text: 'partial continuation' }];
+    entered.resolve(); await gate.promise;
+    return [call('ls', { path: root })];
+  }, capture);
+  const store = createRunStore('retained');
+  const rejected = assert.rejects(run(runtime, { agent: first.agent, store, snapshot: changed }), error => {
+    assert.equal(error.agent.context_.at(-1).outcome, 'summary'); return true;
+  });
+  await entered.promise;
+  store.dispatch({ type: 'interrupted', reason: 'user_stopped', message: 'Stopped by the user' });
+  gate.resolve(); await rejected;
+  assert.equal(capture[1].selected.id, snapshot.config.model);
+  assert.equal(capture[1].options.reasoning, snapshot.config.thinkingLevel);
+  assert.equal(capture[1].options.sessionId, first.agent.context_[0].sessionId);
+  store.close();
+});
+
+test('stop on the first running publication does not start research or a needless handoff', async () => {
+  const { createRunStore } = await jiti.import('../src/store.ts');
+  let stopped = false;
+  const store = createRunStore('before-first-request', view => {
+    if (view.phase === 'running' && !stopped) {
+      stopped = true;
+      store.dispatch({ type: 'interrupted', reason: 'user_stopped', message: 'Stopped by the user' });
+    }
+  });
+  const capture = [];
+  await assert.rejects(run(await scriptedRuntime(() => [submit('must not run')], capture), { store }), /Stopped by the user/);
+  assert.equal(capture.length, 0);
+  store.close();
+});
+
+test('a provider that throws while streaming preserves partial output for handoff', async () => {
+  const { createRunStore } = await jiti.import('../src/store.ts');
+  const store = createRunStore('throwing-stream');
+  const entered = deferred();
+  const runtime = await scriptedRuntime((_turn, context) => {
+    assert.match(lastUserText(context), /interrupted text from stream/);
+    return [{ type: 'text', text: 'Partial summary' }];
+  });
+  const report = runtime.streamSimple;
+  runtime.streamSimple = (model, context, options) => isHandoff(context) ? report(model, context, options) : {
+    async *[Symbol.asyncIterator]() {
+      yield { partial: { content: [{ type: 'text', text: 'interrupted text from stream' }] } };
+      entered.resolve();
+      await waitAbort(options.signal);
+    },
+    result: async () => { throw new Error('must not reach final result after stream throws'); },
+  };
+  const rejected = assert.rejects(run(runtime, { store }), error => {
+    assert.equal(error.agent.context_.at(-1).outcome, 'summary');
+    assert.equal(error.turns, 1, 'interrupted request is counted');
+    return true;
+  });
+  await entered.promise;
+  store.dispatch({ type: 'interrupted', reason: 'user_hard_stopped', message: 'Hard-stopped by the user' });
+  await rejected;
+  store.close();
+});
+
+test('hard stop aborts an executing shell tool and then reports from its recorded result', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-hard-tool-'));
+  const { createRunStore } = await jiti.import('../src/store.ts');
+  const { access } = await import('node:fs/promises');
+  const store = createRunStore('hard-tool');
+  try {
+    const marker = join(dir, 'started');
+    const capture = [];
+    const runtime = await scriptedRuntime((_turn, context) => isHandoff(context)
+      ? [{ type: 'text', text: 'Shell operation interrupted.' }]
+      : [call('bash', { command: `touch '${marker}'; sleep 5; echo should-not-complete` })], capture);
+    const config = structuredClone(snapshot); config.config.tools.allowBash = true;
+    const rejected = assert.rejects(run(runtime, { store, snapshot: config }), error => {
+      const result = error.agent.context_.find(e => e.__type === 'ET.ToolResult');
+      assert(result.isError);
+      assert.equal(error.agent.context_.at(-1).outcome, 'summary');
+      assert.match(JSON.stringify(capture.at(-1).context), /bash/);
+      return true;
+    });
+    for (let n = 0; ; n++) {
+      try { await access(marker); break; } catch { if (n > 200) throw new Error('Tool did not start'); await new Promise(r => setTimeout(r, 5)); }
+    }
+    store.dispatch({ type: 'interrupted', reason: 'user_hard_stopped', message: 'Hard-stopped by the user' });
+    await rejected;
+    assert.equal(capture.length, 2);
+  } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('hard queued stop makes no reporting call and does not interrupt its sibling', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-hard-queued-'));
+  try {
+    const gate = deferred(), entered = deferred();
+    const h = await extensionHarness(dir, async () => { entered.resolve(); await gate.promise; return [submit('sibling done')]; });
+    const config = JSON.parse(await (await import('node:fs/promises')).readFile(join(dir, 'config.json'), 'utf8'));
+    config.limits.maxConcurrentInvestigations = 1;
+    await writeFile(join(dir, 'config.json'), JSON.stringify(config));
+    await h.start();
+    const sibling = h.tools[0].execute('sibling', { question: 'hold' }, undefined, undefined, h.ctx);
+    await entered.promise;
+    let name;
+    const queued = h.tools[0].execute('queued', { question: 'queued' }, undefined, u => { name = u.details.snapshot.name; }, h.ctx);
+    await h.input(`@${name} /stopp`);
+    const stopped = await queued;
+    assert.match(stopped.content[0].text, /Hard-stopped/);
+    assert.equal(h.contexts.length, 1);
+    gate.resolve();
+    assert.equal((await sibling).isError, undefined);
+    await h.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 test('names are shown from launch, never reused, and @name messages reach the running investigator', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'investigate-names-'));

@@ -65,6 +65,8 @@ The user can write to an investigator directly, by typing `@name message`. Such 
 - When the message arrives while it is finishing, the result lists it, and the investigator continues with it in a new run afterwards.
 - When the investigator has finished, the message resumes it with its full context.
 
+The user can also issue `@name /status` (local UI only), `@name /stop` (finish the current operation, then stop research), or `@name /stopp` (abort the current operation). After either stop, one reporting call summarizes the recorded work for you using the investigator's own model; it does no research and executes no tools. The result explicitly identifies the stop and labels the handoff as partial work, not a completed answer. If reporting fails or is hard-stopped, a deterministic activity log replaces the summary; it is not verified findings. A queued run with no model work needs no summary; an already-accepted answer can still be returned. Investigators retain their recorded work and handoff for explicit resumption. Unread messages are reported and do not automatically resume a stopped run. Do not automatically restart work the user explicitly stopped.
+
 A run the user started reaches you as a separate message rather than a tool result. It starts with the same line, says that the user resumed the investigator directly and with which messages, and then gives the answer. Treat it like a result you asked for: use the answer and respond to the user. Do not continue that investigator while such a run is in progress; the call is refused with status `running`.
 
 ### Effort guide

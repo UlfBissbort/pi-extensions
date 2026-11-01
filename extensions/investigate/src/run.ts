@@ -7,15 +7,15 @@
 // command. The edge (worker.ts) performs the I/O and feeds the outcome back as an
 // event. Facts get their UIDs and timestamps at the edge, so commands that add
 // entries carry drafts.
-import type { AssistantMessage, Context, ToolCall } from '@earendil-works/pi-ai';
+import type { AssistantMessage, Context, ToolCall, Usage } from '@earendil-works/pi-ai';
 import {
-  config, nextStep, render, status, SUBMIT, turnsInRun,
+  acceptedSubmission, config, isUserStop, nextStep, render, status, SUBMIT, turnsInRun,
   type AgentStatus, type Entry, type InvestigationAgent, type RunEndReason, type ToolResult,
 } from './agent.ts';
 
-export type Phase = 'queued' | 'starting' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type Phase = 'queued' | 'starting' | 'running' | 'handing_off' | 'completed' | 'failed' | 'cancelled';
 export type StreamingContent = AssistantMessage['content'];
-type Effect = 'model' | 'tools' | 'record';
+type Effect = 'model' | 'tools' | 'record' | 'handoff';
 
 export type RunState = {
   requestId: string; railIndex: number; phase: Phase; note?: string; model?: string;
@@ -24,6 +24,11 @@ export type RunState = {
   agent?: InvestigationAgent;          // the append-only record; source of truth for facts
   streaming?: StreamingContent;        // partial model response, not yet a fact
   awaiting?: Effect;                   // the effect the edge is performing for this run
+  researchStarted?: boolean;
+  modelActive?: boolean;
+  partial?: StreamingContent;
+  interruptedModel?: boolean;
+  partialUsage?: Usage;
   stop?: { reason: RunEndReason; message: string };   // requested end, applied at the next step
 };
 
@@ -31,10 +36,11 @@ export type RunEvent =
   | { type: 'phase'; phase: Phase; note?: string; model?: string }
   | { type: 'started'; agent: InvestigationAgent }            // config and request recorded
   | { type: 'appended'; entries: Entry[] }                    // facts; a tool batch arrives at once
+  | { type: 'model_started' }
   | { type: 'streamed'; content: StreamingContent }
   | { type: 'messaged'; content: string }                    // the user wrote to this investigator
   | { type: 'interrupted'; reason: RunEndReason; message: string }   // e.g. abort; the current effect may still finish
-  | { type: 'failed'; reason: RunEndReason; message: string };       // the current effect threw
+  | { type: 'failed'; reason: RunEndReason; message: string; usage?: Usage };       // the current effect threw
 
 // Entries as decided by the reducer, before the edge gives them identity and time.
 type Unstamped<E> = E extends Entry ? Omit<E, '__uid' | 'timestamp'> : never;
@@ -45,6 +51,8 @@ export type RunCommand =
   | { type: 'callModel'; context: Context; sessionId: string }
   | { type: 'executeTools'; calls: ToolCall[] }
   | { type: 'record'; drafts: EntryDraft[] }
+  | { type: 'abort'; stage: 'research' | 'handoff' }
+  | { type: 'handoff'; agent: InvestigationAgent; trigger: '/stop' | '/stopp' }
   | { type: 'done' };
 
 export const initRun = (requestId: string, railIndex = 0, name?: string): RunState =>
@@ -59,8 +67,13 @@ const without = <T extends object, K extends keyof T>(value: T, ...keys: K[]): O
 // What the run does next, from data alone. A requested stop wins over the record's own next step.
 function next(state: RunState): RunCommand[] {
   const agent = state.agent;
-  if (!agent || status(agent) !== 'running') return [{ type: 'done' }];
-  if (state.stop) return [{ type: 'record', drafts: [{ __type: 'ET.RunEnded', reason: state.stop.reason, message: state.stop.message }] }];
+  if (!agent) return [{ type: 'done' }];
+  const last = agent.context_.at(-1);
+  if (last?.__type === 'ET.RunEnded' && isUserStop(last.reason) && state.researchStarted) return [{ type: 'handoff', agent, trigger: last.reason === 'user_hard_stopped' ? '/stopp' : '/stop' }];
+  if (status(agent) !== 'running') return [{ type: 'done' }];
+  // An accepted answer wins the race with a stop; do not pay for a redundant handoff.
+  if (acceptedSubmission(agent)) return [{ type: 'record', drafts: [{ __type: 'ET.RunEnded', reason: 'submitted' }] }];
+  if (state.stop) return [{ type: 'record', drafts: [{ __type: 'ET.RunEnded', reason: state.stop.reason, message: state.stop.message, ...(state.partial ? { partial: state.partial } : {}), ...(state.partialUsage ? { usage: state.partialUsage } : {}), ...(state.interruptedModel ? { interruptedModel: true } : {}) }] }];
   const step = nextStep(agent);
   switch (step.kind) {
     case 'call_model': return [{ type: 'callModel', context: render(agent), sessionId: config(agent).sessionId }];
@@ -74,8 +87,8 @@ function next(state: RunState): RunCommand[] {
   }
 }
 const awaiting = (commands: RunCommand[]): Effect | undefined => {
-  const c = commands.find(c => c.type === 'callModel' || c.type === 'executeTools' || c.type === 'record');
-  return c?.type === 'callModel' ? 'model' : c?.type === 'executeTools' ? 'tools' : c?.type === 'record' ? 'record' : undefined;
+  const c = commands.find(c => c.type === 'callModel' || c.type === 'executeTools' || c.type === 'record' || c.type === 'handoff');
+  return c?.type === 'callModel' ? 'model' : c?.type === 'executeTools' ? 'tools' : c?.type === 'record' ? 'record' : c?.type === 'handoff' ? 'handoff' : undefined;
 };
 // User messages enter only at a turn boundary, right before the next model call,
 // so they never separate a response's tool calls from their results.
@@ -87,6 +100,7 @@ const proceed = (prior: RunState): [RunState, RunCommand[]] => {
     state = without(state, 'inbox');
   }
   const effect = awaiting(commands);
+  if (effect === 'handoff') state = { ...without(state, 'streaming'), phase: 'handing_off' };
   return [effect ? { ...state, awaiting: effect } : without(state, 'awaiting'), [{ type: 'publish', throttle: false }, ...commands]];
 };
 
@@ -98,15 +112,16 @@ export function reduceRun(state: RunState, event: RunEvent): [RunState, RunComma
     }
     case 'started': {
       const c = config(event.agent);
-      return proceed({ ...without(state, 'note', 'streaming', 'stop'), agent: event.agent, phase: 'running', model: `${c.provider}/${c.model}` });
+      return proceed({ ...without(state, 'note', 'streaming'), agent: event.agent, phase: 'running', model: `${c.provider}/${c.model}` });
     }
     case 'appended': {
       if (!state.agent) return [state, []];
       const agent = { ...state.agent, context_: [...state.agent.context_, ...event.entries] };
       // A recorded response supersedes its streaming preview.
       const recordedResponse = event.entries.some(e => e.__type === 'ET.LLMResponse');
-      return proceed({ ...(recordedResponse ? without(state, 'streaming') : state), agent });
+      return proceed({ ...(recordedResponse ? { ...without(state, 'streaming', 'modelActive'), researchStarted: true } : state), agent });
     }
+    case 'model_started': return [{ ...state, researchStarted: true, modelActive: true }, []];
     case 'streamed':
       return [{ ...state, streaming: event.content }, [{ type: 'publish', throttle: true }]];
     case 'messaged': {
@@ -116,13 +131,18 @@ export function reduceRun(state: RunState, event: RunEvent): [RunState, RunComma
       return [queued, [{ type: 'publish', throttle: false }]];
     }
     case 'interrupted': {
-      if (state.stop) return [state, []];
+      const hard = event.reason === 'user_hard_stopped';
+      if (state.awaiting === 'handoff') return hard ? [state, [{ type: 'abort', stage: 'handoff' }]] : [state, []];
+      if (state.stop && !(hard && state.stop.reason === 'user_stopped')) return [state, []];
       const stopped = { ...state, stop: { reason: event.reason, message: event.message } };
-      // With an effect outstanding, its outcome is recorded first; the stop applies after it.
-      return stopped.awaiting ? [stopped, []] : proceed(stopped);
+      const [nextState, commands] = stopped.awaiting ? [stopped, [{ type: 'publish', throttle: false }] as RunCommand[]] : proceed(stopped);
+      return [nextState, [...(hard ? [{ type: 'abort', stage: 'research' } as RunCommand] : []), ...commands]];
     }
     case 'failed':
-      return proceed({ ...without(state, 'awaiting', 'streaming'), stop: state.stop ?? { reason: event.reason, message: event.message } });
+      return proceed({ ...without(state, 'awaiting', 'streaming', 'modelActive'),
+        ...(state.modelActive ? { interruptedModel: true, ...(state.streaming ? { partial: state.streaming } : {}) } : {}),
+        ...(event.usage ? { partialUsage: event.usage } : {}),
+        stop: state.stop ?? { reason: event.reason, message: event.message } });
   }
 }
 
@@ -191,6 +211,7 @@ export function steps(agent: InvestigationAgent | undefined, streaming?: Streami
           : { ...s, ...outcome, resultText: resultText(e.content), ...(e.durationMs === undefined ? {} : { durationMs: e.durationMs }) };
         break;
       }
+      case 'ET.Handoff': out.push({ id: e.__uid, kind: 'host', text: `Handoff (${e.outcome}) · cache read: ${e.usage.cacheRead} tokens · uncached input: ${e.usage.input} tokens\n${e.text}` }); break;
       case 'ET.HostInstruction': out.push({ id: e.__uid, kind: 'host', text: e.content }); break;
       case 'ET.UserMessage': out.push({ id: e.__uid, kind: 'user', text: e.content }); break;
       case 'ET.RunEnded': out.push({ id: `run:${run}:end`, kind: 'end', reason: e.reason, ...(e.message === undefined ? {} : { message: e.message }) }); break;

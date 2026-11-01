@@ -3,11 +3,17 @@ import { resolve } from 'node:path';
 import { EFFORT_FIELDS, exactKeys, nonblank, positive, extractPrompt, limitsForEffort } from './core.mjs';
 
 export function validateConfig(c) {
-  exactKeys(c, ['provider', 'model', 'thinkingLevel', 'instructionsFile', 'parentPromptFile', 'repositoryMapFile', 'defaults', 'tools', 'limits', 'effortScale'], 'config');
+  exactKeys(c, ['provider', 'model', 'thinkingLevel', 'instructionsFile', 'parentPromptFile', 'repositoryMapFile', 'defaults', 'tools', 'limits', 'effortScale', 'handoff'], 'config');
   for (const key of ['provider', 'model', 'instructionsFile', 'parentPromptFile', 'repositoryMapFile']) nonblank(c[key], key);
   if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(c.thinkingLevel)) throw new Error('Invalid thinkingLevel');
   exactKeys(c.defaults, ['detail', 'includeReferences', 'effort'], 'defaults');
   if (!['brief', 'standard', 'detailed'].includes(c.defaults.detail) || typeof c.defaults.includeReferences !== 'boolean' || !Number.isSafeInteger(c.defaults.effort) || c.defaults.effort < 0 || c.defaults.effort > 10) throw new Error('Invalid defaults');
+  if (c.handoff !== undefined) {
+    exactKeys(c.handoff, ['timeoutSeconds', 'maxOutputTokens'], 'handoff');
+    positive(c.handoff.timeoutSeconds, 'handoff.timeoutSeconds');
+    positive(c.handoff.maxOutputTokens, 'handoff.maxOutputTokens');
+    if (c.handoff.timeoutSeconds > 300 || c.handoff.maxOutputTokens > 32768) throw new Error('Unsafe handoff limit');
+  }
   exactKeys(c.tools, ['allowBash'], 'tools');
   if (typeof c.tools.allowBash !== 'boolean') throw new Error('allowBash must be boolean');
   const keys = ['maxConcurrentInvestigations', 'maxTurns', 'timeoutSeconds', 'maxRequestCharacters', 'maxAnswerCharacters', 'maxExcerpts', 'maxExcerptCharacters', 'maxResponseCharacters', 'maxFileBytes'];

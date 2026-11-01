@@ -150,7 +150,7 @@ export function renderDisplay(state: DisplayState, width: number, style: Style):
     ? [style.fg('accent', style.bold(view.name)), handle].filter(Boolean).join(style.fg('dim', ' = '))
     : handle ? style.fg('accent', style.bold(view.handle!)) : style.fg('toolTitle', style.bold('investigate'));
   // While a run is active the phase says most; once it ends, the agent's status does.
-  const phase = ['queued', 'starting', 'running'].includes(view.phase) ? view.phase : view.agentStatus ?? view.phase;
+  const phase = view.phase === 'handing_off' ? 'handing off' : ['queued', 'starting', 'running'].includes(view.phase) ? view.phase : view.agentStatus ?? view.phase;
   const pending = view.pendingMessages ? `${plural(view.pendingMessages, 'message')} from you waiting` : undefined;
   const facts = style.fg('dim', `· ${safeDisplay([phase, plural(view.turns, 'model request'), pending, state.defaultOpen ? view.model : undefined].filter(Boolean).join(' · '))}`);
   // Name and handle together are long; the facts move to their own line rather than being cut off.
