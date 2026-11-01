@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { zeroUsage } from '../src/core.mjs';
 import { jiti } from './jiti.mjs';
 
-const { initRun, reduceRun, steps, snapshot, MAX_STEPS, MAX_TOTAL_TEXT, stepSize } = await jiti.import('../src/run.ts');
+const { initRun, reduceRun, steps, snapshot, MAX_STEP_TEXT } = await jiti.import('../src/run.ts');
 const { status } = await jiti.import('../src/agent.ts');
 
 const u = n => `🍃-${String(n).padStart(20, '0')}`;
@@ -62,8 +62,7 @@ test('tool steps keep the supplied arguments and model-visible results without c
     { ...result(4, 'big', 'read'), content: [{ type: 'text', text: 'y'.repeat(30000) }] }] };
   const bounded = snapshot({ ...initRun('r'), agent: long });
   const step = bounded.steps.at(-1);
-  assert(step.argumentsText.length <= 6000 && step.resultText.length <= 6000);
-  assert(bounded.steps.reduce((n, s) => n + stepSize(s), 0) <= MAX_TOTAL_TEXT);
+  assert(step.argumentsText.length <= MAX_STEP_TEXT && step.resultText.length <= MAX_STEP_TEXT);
   assert(!JSON.stringify(bounded).includes('y'.repeat(30000)));
 });
 
@@ -80,14 +79,23 @@ test('a step keeps its id from streaming to recorded', () => {
   assert.deepEqual(reused.slice(1).map(s => [s.id, s.outcome]), [['turn:1:call:x', 'ok'], ['turn:2:call:x', 'pending']]);
 });
 
-test('the snapshot is bounded, plain data, and reports what it dropped', () => {
-  const many = { ...started, context_: [...started.context_,
-    ...Array.from({ length: 200 }, (_, i) => response(100 + i, [{ type: 'text', text: 'x'.repeat(5000) }]))] };
-  const s = snapshot({ ...initRun('r'), agent: many });
-  assert(s.steps.length <= MAX_STEPS);
-  assert(s.steps.reduce((n, x) => n + stepSize(x), 0) <= MAX_TOTAL_TEXT);
-  assert.equal(s.omitted + s.steps.length, 201);
-  assert.equal(s.steps.at(-1).id, 'turn:200:text', 'newest steps are kept');
+test('a long snapshot keeps every step in order while bounding individual bodies', () => {
+  const entries = [started.context_[0], started.context_[1]];
+  for (let i = 1; i <= 120; i++) {
+    entries.push(response(100 + i, [{ type: 'text', text: 'x'.repeat(8000) }, call('read', { path: `file-${i}` }, `c${i}`)]));
+    entries.push(result(300 + i, `c${i}`, 'read', false, 'y'.repeat(8000)));
+  }
+  const s = snapshot({ ...initRun('r'), agent: { ...started, context_: entries } });
+  assert.equal(s.steps.length, 241, 'request, model text, and tool call for every turn');
+  assert.equal(s.steps[0].id, 'run:1:request', 'the oldest step is still present');
+  for (let i = 1; i <= 120; i++) {
+    const [model, tool] = s.steps.slice(1 + (i - 1) * 2, 1 + i * 2);
+    assert.equal(model.id, `turn:${i}:text`);
+    assert.equal(tool.id, `turn:${i}:call:c${i}`);
+    assert.equal(tool.resultText.length <= MAX_STEP_TEXT, true);
+    assert(model.text.length <= MAX_STEP_TEXT);
+  }
+  assert(!('omitted' in s), 'new snapshots never report missing steps');
   assert.deepEqual(JSON.parse(JSON.stringify(s)), s);
   const one = snapshot({ ...initRun('r', 4), phase: 'completed', agent });
   assert.equal(one.railIndex, 4, 'the semantic lane survives the snapshot boundary');

@@ -152,7 +152,8 @@ export function renderDisplay(state: DisplayState, width: number, style: Style):
     const color: Fg = view.phase === 'failed' || view.phase === 'cancelled' ? 'error' : 'muted';
     lines.push(...wrapTextWithAnsi(style.fg(color, safeDisplay(view.note)), innerWidth));
   }
-  if (view.omitted) lines.push(style.fg('dim', truncateToWidth(`  ${plural(view.omitted, 'earlier step')} omitted from bounded UI history`, innerWidth, '…')));
+  // Only old persisted snapshots can have missing steps; do not conceal that fact.
+  if (view.omitted) lines.push(style.fg('dim', truncateToWidth(`  ${plural(view.omitted, 'earlier step')} omitted from this older saved snapshot`, innerWidth, '…')));
   const targets: (Target | undefined)[] = lines.map(() => undefined);
   const boxes = view.steps.map(stepBox);
   if (state.final) boxes.push(resultBox(state.final));

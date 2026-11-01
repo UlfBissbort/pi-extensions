@@ -29,7 +29,7 @@ function fakeTerminal() {
 
 const long = (tag, n = 8) => Array.from({ length: n }, (_, i) => `line ${tag}.${i}`).join('\n');
 const snapshot = {
-  requestId: 'r1', railIndex: 0, handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'running', agentStatus: 'running', model: 'p/m', turns: 2, omitted: 0,
+  requestId: 'r1', railIndex: 0, handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'running', agentStatus: 'running', model: 'p/m', turns: 2,
   steps: [
     { id: 'run:1:request', kind: 'request', question: 'Where is config loaded?' },
     { id: 'turn:1:text', kind: 'model', text: long('A'), live: false },

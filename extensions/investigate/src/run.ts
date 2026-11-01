@@ -178,18 +178,17 @@ export function steps(agent: InvestigationAgent | undefined, streaming?: Streami
 
 // The snapshot crosses from the worker to Pi's tool display in tool-result
 // details, which Pi stores in the parent session. It holds semantic steps, never
-// display strings or the full record, and is bounded so it stays small.
+// display strings or the full record. Every step is retained in its original
+// order; only text within individual steps is shortened for the UI.
 export type Snapshot = {
   requestId: string; railIndex: number; handle?: string;
   phase: Phase; agentStatus?: AgentStatus; note?: string; model?: string;
   turns: number;
   steps: Step[];
-  omitted: number;                     // oldest steps dropped by the bounds
+  omitted?: number;                    // legacy snapshots only; new runs never drop steps
 };
 
-export const MAX_STEPS = 80;
 export const MAX_STEP_TEXT = 6000;
-export const MAX_TOTAL_TEXT = 24000;
 const MAX_ARG_TEXT = 1000;
 
 const bounded = (text: string, max = MAX_STEP_TEXT) => text.length <= max
@@ -204,25 +203,14 @@ function boundStep(s: Step): Step {
     case 'end': return s.message === undefined ? s : { ...s, message: bounded(s.message) };
   }
 }
-export const stepSize = (s: Step) => JSON.stringify(s).length;
-
-// Keep the newest steps within count and size limits; report how many were dropped.
-export function boundSteps(all: Step[]): { steps: Step[]; omitted: number } {
-  const kept = all.map(boundStep);
-  let total = kept.reduce((n, s) => n + stepSize(s), 0);
-  let omitted = 0;
-  while (kept.length > 1 && (kept.length > MAX_STEPS || total > MAX_TOTAL_TEXT)) {
-    total -= stepSize(kept.shift()!);
-    omitted++;
-  }
-  return { steps: kept, omitted };
-}
+// Never discard a step or reorder the tool-call sequence, even in a long run.
+export const boundSteps = (all: Step[]): Step[] => all.map(boundStep);
 
 export function snapshot(state: RunState): Snapshot {
   const agent = state.agent;
-  const bound = boundSteps(steps(agent, state.streaming));
   return {
-    requestId: state.requestId, railIndex: state.railIndex, phase: state.phase, ...bound,
+    requestId: state.requestId, railIndex: state.railIndex, phase: state.phase,
+    steps: boundSteps(steps(agent, state.streaming)),
     turns: agent ? turnsInRun(agent) + (state.streaming ? 1 : 0) : 0,
     ...(agent ? { handle: `ET.InvestigationAgent('${agent.__uid}')`, agentStatus: status(agent) } : {}),
     ...(state.note === undefined ? {} : { note: state.note }),

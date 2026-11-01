@@ -9,7 +9,7 @@ const { visibleWidth, ScrollView, rgbColor, colorToRgb } = await import(tuiPath)
 
 const long = (tag, n = 8) => Array.from({ length: n }, (_, i) => `line ${tag}.${i}`).join('\n');
 const snapshot = {
-  requestId: 'r1', railIndex: 0, handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'completed', agentStatus: 'answered', model: 'p/m', turns: 2, omitted: 0,
+  requestId: 'r1', railIndex: 0, handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'completed', agentStatus: 'answered', model: 'p/m', turns: 2,
   steps: [
     { id: 'run:1:request', kind: 'request', question: 'Where is config loaded?' },
     { id: 'turn:1:text', kind: 'model', text: long('A'), live: false },
@@ -84,6 +84,23 @@ test('a continuous, stable colour rail distinguishes adjacent agents without cha
   const oldA = renderDisplay(reduceDisplay(initDisplay(false), { type: 'snapshot', snapshot: { ...oldSnapshot, requestId: 'old-1' } })[0], 60, colored);
   const oldB = renderDisplay(reduceDisplay(initDisplay(false), { type: 'snapshot', snapshot: { ...oldSnapshot, requestId: 'old-2' } })[0], 60, colored);
   assert.notEqual(oldA.lines[0].match(/(\x1b\[[0-9;]+m)▌/)?.[1], oldB.lines[0].match(/(\x1b\[[0-9;]+m)▌/)?.[1], 'older session snapshots are assigned stable request-based rails');
+});
+
+test('a long display shows every tool call, including the oldest, without an omitted-steps banner', () => {
+  const many = { ...snapshot, steps: Array.from({ length: 120 }, (_, i) => ({
+    id: `turn:${i + 1}:call:c${i + 1}`, kind: 'tool', name: 'read', args: { path: `file-${i + 1}` },
+    argumentsText: `{"path":"file-${i + 1}"}`, resultText: `result ${i + 1}`, outcome: 'ok', live: false,
+  })) };
+  const state = reduceDisplay(initDisplay(false), { type: 'snapshot', snapshot: many })[0];
+  const rendered = renderDisplay(state, 60, style);
+  assert.equal(headRows(rendered).length, 120);
+  assert(plain(rendered.lines.join('\n')).includes('file-1'));
+  assert(plain(rendered.lines.join('\n')).includes('file-120'));
+  assert(!plain(rendered.lines.join('\n')).includes('earlier steps omitted'));
+  assert(rendered.lines.every(l => visibleWidth(l) <= 60));
+  assert.equal(rendered.targets.length, rendered.lines.length);
+  const legacy = renderDisplay(reduceDisplay(initDisplay(false), { type: 'snapshot', snapshot: { ...many, omitted: 22 } })[0], 60, style);
+  assert(plain(legacy.lines.join('\n')).includes('22 earlier steps omitted'), 'older saved snapshots report missing history honestly');
 });
 
 test('every step is one coloured box under the agent handle, within the width', () => {
