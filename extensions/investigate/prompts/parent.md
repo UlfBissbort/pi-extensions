@@ -27,6 +27,7 @@ Use direct tools when a direct operation is specifically more appropriate, such 
 
 ```typescript
 investigate({
+  agent?: string,
   question: string,
   context?: string,
   scope?: string[],
@@ -36,12 +37,27 @@ investigate({
 })
 ```
 
-- `question`: A self-contained question or information-gathering objective. State requirements such as comparisons, runnable examples, source excerpts, or search thoroughness here.
-- `context`: Relevant background and constraints. The investigator cannot see your conversation or previous investigation calls.
-- `scope`: Optional repository/collection names from the available map, or explicit paths, to prioritize. This is a search focus, not an access restriction.
+- `agent`: Handle of an earlier investigator to continue it with everything it already did; see "New or continued investigator". Omit to start a new investigator.
+- `question`: For a new investigator, a self-contained question or information-gathering objective. For a continued one, the follow-up only; it already has its earlier task and findings. State requirements such as comparisons, runnable examples, source excerpts, or search thoroughness here.
+- `context`: Relevant background and constraints. An investigator never sees your conversation; a new one also sees nothing of other investigations. When continuing, supply only new background.
+- `scope`: Optional repository/collection names from the available map, or explicit paths, to prioritize. This is a search focus, not an access restriction. When continuing, it applies to the follow-up.
 - `detail`: Final-answer detail, not investigation depth. Defaults to `standard`.
 - `include_references`: Include source references and further-reading links. Defaults to `true`.
 - `effort`: Optional integer from `0` to `10` (default `4`). Sets the budget for research calls, time, answer text, and excerpts. These are ceilings, not targets for answer length. Omit it for normal lookups; choose a higher value when the requested evidence or breadth warrants it.
+
+### Result
+
+Every result whose investigator exists starts with one line: its handle and status.
+
+```text
+ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60') answered
+```
+
+- `answered`: it submitted an answer, which follows.
+- `resumable`: it stopped without an answer (budget, deadline, cancellation, or error); the reason follows. It keeps everything it did and can be continued.
+- `running`: this call did not start because the investigator is still busy with an earlier call; its record is unaffected.
+
+A result without this line means no investigator was involved, for example an unknown handle, a configuration problem, or a cancellation while queued.
 
 ### Effort guide
 
@@ -54,7 +70,7 @@ investigate({
 | 8 | Deep investigation | 97 | ~7m08s | ~161k characters | 30 |
 | 10 | Exceptional breadth/depth | 150 | 10m | 240k characters | 40 |
 
-Intermediate values interpolate; the answer-text ceiling is half the total-response ceiling shown. Time includes queue wait. Excerpts share the total-response budget, so the maximum excerpt count may not fit at maximum excerpt length. Start with the lowest useful effort; a high setting does not require a long answer.
+Intermediate values interpolate; the answer-text ceiling is half the total-response ceiling shown. Budgets apply per call: a continued investigator gets the budget of the new call's `effort`, not what remained from earlier calls. Time includes queue wait. Excerpts share the total-response budget, so the maximum excerpt count may not fit at maximum excerpt length. Start with the lowest useful effort; a high setting does not require a long answer.
 
 ### Answers and source material
 
@@ -66,9 +82,15 @@ Specify the deliverable, not every research step: name the targets and relevant 
 
 Before answering the user, match every requested target against the actual returned excerpts and omission warnings—not just the investigator's coverage labels. Retrieve missing source with targeted follow-ups or clearly state what remains incomplete. If the user requested actual code, deliver it (in explicit parts if necessary); do not silently substitute links or summaries. Carry verified corrections back into your answer.
 
+### New or continued investigator
+
+Continue an investigator when the next question builds on what it found: a follow-up, a correction, more source for something it located, or finishing a `resumable` run. It keeps its full previous context, including every file it read and its earlier answers, so it does not repeat the search; ask only for what is new. Start a new investigator for an unrelated question; its context is then small and focused. Each continuation resends the whole earlier history, so stop continuing once the topic has moved on.
+
+An investigator handles one call at a time. Do not continue the same handle in parallel calls; to explore several directions at once, start separate investigators. Handles last only while the extension stays loaded and only for recent investigators; an unknown handle returns an error, after which start a new investigation and pass what it needs in `context`.
+
 ### Parallel investigations
 
-Before issuing separate investigations, ask whether one needs the other’s findings to answer reliably; if so, combine them or run them sequentially with an explicit findings handoff, otherwise parallelize. For independent questions, issue multiple ordinary `investigate` calls in the same response so they can execute concurrently.
+Before issuing separate investigations, ask whether one needs the other’s findings to answer reliably; if so, combine them, continue the investigator that has the findings, or run them sequentially with an explicit findings handoff; otherwise parallelize. For independent questions, issue multiple ordinary `investigate` calls in the same response so they can execute concurrently.
 
 ### Examples
 
@@ -105,6 +127,16 @@ investigate({
 ```
 
 If the result establishes that the inspected overload requires an initial value but does not establish a default overload, correct the earlier example accordingly; do not claim that no default overload exists anywhere. If one requested body is missing, fetch it before presenting the source delivery as complete.
+
+Continue an investigator after its answer:
+
+```javascript
+investigate({
+  agent: "ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60')",
+  question: "In the merge function you found, how are nested sections of config.local.json combined? Include that branch as an excerpt.",
+  effort: 2
+})
+```
 
 For an ordinary lookup:
 

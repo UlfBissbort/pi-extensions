@@ -10,12 +10,13 @@ import { assembleResponse, limitsForEffort, validateSubmission, zeroUsage } from
 import type { EntryDraft, RunCommand, RunEvent } from './run.ts';
 import { createRunStore, type RunStore } from './store.ts';
 import {
-  acceptedSubmission, currentRun, SUBMIT, turnsInRun, usage,
+  acceptedSubmission, config as agentConfig, currentRun, SUBMIT, turnsInRun, usage,
   type Entry, type InvestigationAgent, type LLMResponse, type ToolDeclaration, type ToolResult, type Uid,
 } from './agent.ts';
 
 export const requestSchema = Type.Object({
-  question: Type.String({ minLength: 1, description: 'Self-contained information need; the investigator cannot see your conversation.' }),
+  agent: Type.Optional(Type.String({ minLength: 1, description: "Handle from the first line of an earlier result, e.g. ET.InvestigationAgent('🍃-…'), to continue that investigator with its full previous context. Omit to start a new investigator." })),
+  question: Type.String({ minLength: 1, description: 'Self-contained information need; the investigator cannot see your conversation. When continuing an agent, only the follow-up.' }),
   context: Type.Optional(Type.String({ description: 'Relevant background and constraints only.' })),
   scope: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: 'Repository/collection aliases or paths to prioritize.' })),
   detail: Type.Optional(Type.Union([Type.Literal('brief'), Type.Literal('standard'), Type.Literal('detailed')], { description: 'Answer detail, not search depth. Default standard.' })),
@@ -62,11 +63,17 @@ const declaration = ({ name, description, parameters, constrainedSampling }: Exe
 // Boundary: runs one investigation. The reducer (run.ts) decides every step from
 // the agent record; this function only performs the commands it returns (model
 // call, tool batch, recording an entry) and feeds each outcome back as an event.
-// Facts get their UIDs and timestamps here, where they arrive.
-export async function runInvestigation({ snapshot, request, cwd, signal, modelRuntime, store = createRunStore(randomUUID()) }: {
-  snapshot: any; request: any; cwd: string; signal: AbortSignal; modelRuntime: ModelRuntime; store?: RunStore;
+// Facts get their UIDs and timestamps here, where they arrive. Given an existing
+// agent, the run continues it: the request is appended to its record, and its
+// recorded model, thinking level, tools, and prompt are kept.
+export async function runInvestigation({ snapshot, request, cwd, signal, modelRuntime, store = createRunStore(randomUUID()), agent: previous }: {
+  snapshot: any; request: any; cwd: string; signal: AbortSignal; modelRuntime: ModelRuntime; store?: RunStore; agent?: InvestigationAgent;
 }) {
-  const { config, workerPrompt, repositoryMap } = snapshot;
+  const { workerPrompt, repositoryMap } = snapshot;
+  const kept = previous && agentConfig(previous);
+  const config = kept
+    ? { ...snapshot.config, provider: kept.provider, model: kept.model, thinkingLevel: kept.thinkingLevel, tools: { ...snapshot.config.tools, allowBash: kept.tools.some(t => t.name === 'bash') } }
+    : snapshot.config;
   const limits = limitsForEffort(config, request.effort ?? config.defaults.effort);
   const abortMessage = () => String(signal.reason?.message ?? signal.reason ?? 'Investigation cancelled');
   const failure = (agent: InvestigationAgent | undefined, message: string) =>
@@ -89,7 +96,7 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
     throw failure(undefined, signal.aborted ? abortMessage() : String((error as Error).message ?? error));
   }
 
-  const root = resolve(cwd);
+  const root = kept ? kept.cwd : resolve(cwd);
   const submit: ExecutableTool = {
     name: SUBMIT,
     description: 'Finish the investigation with final text and optional exact file selections. Must be the only tool call in this batch. Lines are 1-based and inclusive.',
@@ -159,14 +166,15 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
   signal.addEventListener('abort', interrupt, { once: true });
   try {
     const now = Date.now();
-    const agent: InvestigationAgent = { __type: 'ET.InvestigationAgent', __uid: newUid(), context_: [
+    const requestEntry: Entry = { __type: 'ET.InvestigationRequest', __uid: newUid(), request, limits, timestamp: now };
+    const agent: InvestigationAgent = previous ? { ...previous, context_: [...previous.context_, requestEntry] } : { __type: 'ET.InvestigationAgent', __uid: newUid(), context_: [
       {
         __type: 'ET.InvestigationConfig', __uid: newUid(),
         provider: model.provider, model: model.id, thinkingLevel: level, sessionId: randomUUID(),
         workerPrompt, repositoryMapSource: config.repositoryMapFile, repositoryMap,
         cwd: root, tools: declarations, timestamp: now,
       },
-      { __type: 'ET.InvestigationRequest', __uid: newUid(), request, limits, timestamp: now },
+      requestEntry,
     ] };
     dispatch({ type: 'started', agent });
     if (signal.aborted) interrupt();

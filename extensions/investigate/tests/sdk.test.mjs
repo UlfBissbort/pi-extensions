@@ -21,6 +21,7 @@ const jiti = createJiti(import.meta.url, {
 const { runInvestigation, isolatedResources } = await jiti.import('../src/worker.ts');
 const { registerInvestigation } = await jiti.import('../src/extension.ts');
 const { steps } = await jiti.import('../src/run.ts');
+const { render } = await jiti.import('../src/agent.ts');
 const { ModelRuntime, createAgentSession, SessionManager, SettingsManager } = await import(`${host}/dist/index.js`);
 const { createAssistantMessageEventStream } = await import(`${host}/node_modules/@earendil-works/pi-ai/dist/index.js`);
 const { convertResponsesMessages } = await import(`${host}/node_modules/@earendil-works/pi-ai/dist/api/openai-responses-shared.js`);
@@ -327,4 +328,76 @@ test('extension registers one tool and adds/removes prompt section without overw
   assert(!('investigation' in event.systemPromptOptions.sections));
   await handlers.session_shutdown();
   await assert.rejects(tools[0].execute('id', { question: 'q' }, undefined, undefined, { cwd: root }), /shutting down/);
+});
+
+test('a continued agent sees its full previous context plus the follow-up, under one system message', async () => {
+  const seen = [];
+  const runtime = await scriptedRuntime(turn => [
+    [call('ls', { path: root }, 'a')], [submit('First')],
+    [submit('Second')],
+  ][turn], seen);
+  const first = await run(runtime);
+  const before = first.agent.context_;
+  const second = await run(runtime, { agent: first.agent, request: { question: 'Follow up', detail: 'brief', include_references: false, effort: 0 } });
+  assert.equal(second.agent.__uid, first.agent.__uid);
+  assert.deepEqual(second.agent.context_.slice(0, before.length), before, 'the record only grows');
+  assert(second.text.includes('Second'));
+  assert.equal(second.turns, 1, 'turns count within the new run');
+  const context = seen[2].context;
+  assert.deepEqual(context.messages.slice(0, -1), structuredClone(render({ ...first.agent, context_: before }).messages), 'the whole first run precedes the follow-up');
+  assert(JSON.stringify(context).includes('First'), 'including its submitted answer');
+  assert.equal(context.messages.filter(m => m.role === 'system').length, 1);
+  const followUp = context.messages.at(-1);
+  assert.equal(followUp.role, 'user');
+  assert.match(followUp.content[0].text, /continues this investigation[\s\S]*At most 2 model requests[\s\S]*"question": "Follow up"/);
+  assert.equal(seen[2].options.sessionId, seen[0].options.sessionId, 'same model session');
+});
+
+test('extension results start with the agent handle, continue by handle, and reject unknown or busy handles', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-continue-'));
+  try {
+    const config = structuredClone(snapshot.config);
+    config.instructionsFile = join(root, 'prompts/worker.md');
+    config.parentPromptFile = join(root, 'prompts/parent.md');
+    config.repositoryMapFile = join(root, 'repository-map.md');
+    await writeFile(join(dir, 'config.json'), JSON.stringify(config));
+    const handlers = {}, tools = [], contexts = [];
+    let unblock;
+    const gate = new Promise(resolve => { unblock = resolve; });
+    await registerInvestigation({ on: (name, fn) => handlers[name] = fn, registerTool: t => tools.push(t) }, dir, {
+      createRuntime: async () => scriptedRuntime(async (_turn, context) => {
+        contexts.push(structuredClone(context));
+        const last = JSON.stringify(context.messages.at(-1));
+        if (last.includes('slow follow-up')) await gate;
+        return [submit(last.includes('follow-up') ? 'Answer two' : 'Answer one')];
+      }),
+    });
+    const tool = tools[0];
+    const first = await tool.execute('a', { question: 'Start' }, undefined, undefined, { cwd: dir });
+    const handle = first.details.agent;
+    assert.match(handle, /^ET\.InvestigationAgent\('🍃-[0-9a-f]{20}'\)$/);
+    assert(first.content[0].text.startsWith(`${handle} answered\n\n<investigation_answer>`), first.content[0].text);
+
+    const second = await tool.execute('b', { agent: handle, question: 'A follow-up' }, undefined, undefined, { cwd: dir });
+    assert(!second.isError, second.content[0].text);
+    assert.equal(second.details.agent, handle);
+    assert(second.content[0].text.startsWith(`${handle} answered\n\n`));
+    assert(second.content[0].text.includes('Answer two'));
+    assert(JSON.stringify(contexts.at(-1)).includes('Answer one'), 'the follow-up sees the first run');
+    // The bare UID works too.
+    const uid = handle.match(/'(.*)'/)[1];
+    const slow = tool.execute('c', { agent: uid, question: 'A slow follow-up' }, undefined, undefined, { cwd: dir });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const busy = await tool.execute('d', { agent: handle, question: 'Parallel follow-up' }, undefined, undefined, { cwd: dir });
+    assert(busy.isError); assert(busy.content[0].text.startsWith(`${handle} running\n\nNot started:`), busy.content[0].text);
+    assert.equal(busy.details.agentStatus, 'running');
+    unblock();
+    assert(!(await slow).isError);
+
+    const unknown = await tool.execute('e', { agent: "ET.InvestigationAgent('🍃-00000000000000000000')", question: 'x' }, undefined, undefined, { cwd: dir });
+    assert(unknown.isError); assert.match(unknown.content[0].text, /^Investigation failed or incomplete: Unknown agent/);
+    const invalid = await tool.execute('f', { agent: 'nonsense', question: 'x' }, undefined, undefined, { cwd: dir });
+    assert(invalid.isError); assert.match(invalid.content[0].text, /Invalid agent handle/);
+    await handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

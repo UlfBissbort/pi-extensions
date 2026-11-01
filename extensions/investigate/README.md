@@ -41,6 +41,20 @@ investigate({
 
 Only `question` is required. `detail` is `brief`, `standard`, or `detailed`. `effort` is an integer from 0 to 10 (default 4), controlling request, time, output, and excerpt budgets. Scope indicates where to prioritize research, not an access restriction. The default permits three simultaneous investigations. Edit the full defaults in `config.json` only when the simple local override is insufficient.
 
+Every result whose investigator exists starts with its handle and status, for example `ET.InvestigationAgent('🍃-…') answered`. The status is `answered` (an answer follows), `resumable` (stopped by budget, deadline, cancellation, or error; the reason follows), or `running` (this call did not start because the investigator is busy with an earlier one).
+
+To continue an investigator, pass its handle as `agent` with the follow-up as `question`:
+
+```typescript
+investigate({
+  agent: "ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60')",
+  question: "How are nested sections of config.local.json combined?",
+  effort: 2
+})
+```
+
+It continues with its full previous context, including the files it read and its earlier answers. Its model, tools, working directory, and leading prompt are kept; `detail`, `include_references`, and `effort` (with its budgets and deadline) apply to the new call. An investigator handles one call at a time. Investigators are kept in memory, the most recent 100, and are lost on reload; an unknown handle returns an error.
+
 The tool returns the answer followed by selected file ranges with provenance. Excerpts are read at submission time and can differ from earlier inspected content. Missing or oversized excerpts are reported. In the TUI, each investigation has a persistent coloured rail down its left edge, so adjacent or parallel agents remain distinguishable. A single click on a tool step opens its call arguments and the result returned to the investigator inside the same box; a second click closes it. Every step remains visible in order, even in long investigations; long arguments and text results are shortened per step, and non-text content such as images gets a placeholder. The snapshot grows with the number of steps. The parent model sees only the final answer, not these intermediate tool results, but Pi persists UI snapshots (including displayed results) in the parent session's tool details; a closed box is not a privacy boundary. Private model reasoning is never shown.
 
 ## Boundaries

@@ -108,12 +108,16 @@ export function nextStep(agent: InvestigationAgent): Step {
   return callModel();
 }
 
+const limitsText = (limits: Limits) => `At most ${limits.maxTurns} model requests. Final answer: ${limits.maxAnswerCharacters} characters. Total returned response including excerpts: ${limits.maxResponseCharacters} characters. At most ${limits.maxExcerpts} excerpts, each ${limits.maxExcerptCharacters} characters; they must also fit the total response budget. No recursive investigation.`;
+
 export function systemPrompt(c: InvestigationConfig, limits: Limits): string {
-  return `${c.workerPrompt}\n\n# Latest repository overview skill\nSource: ${c.repositoryMapSource}\n\n${c.repositoryMap}\n\n# Hard limits\nAt most ${limits.maxTurns} model requests. Final answer: ${limits.maxAnswerCharacters} characters. Total returned response including excerpts: ${limits.maxResponseCharacters} characters. At most ${limits.maxExcerpts} excerpts, each ${limits.maxExcerptCharacters} characters; they must also fit the total response budget. No recursive investigation.`;
+  return `${c.workerPrompt}\n\n# Latest repository overview skill\nSource: ${c.repositoryMapSource}\n\n${c.repositoryMap}\n\n# Hard limits\n${limitsText(limits)}`;
 }
 
 // The model-facing projection. The leading system message carries the prompt and
 // tool declarations, as Pi sends them; the request JSON becomes the first user turn.
+// A later request continues the same conversation: it becomes a user turn with its
+// own limits, and the leading system message stays unchanged so the cache holds.
 export function render(agent: InvestigationAgent): Context {
   const messages: Message[] = [];
   let latestConfig: InvestigationConfig | undefined;
@@ -122,6 +126,10 @@ export function render(agent: InvestigationAgent): Context {
       case 'ET.InvestigationConfig': latestConfig = e; break;
       case 'ET.InvestigationRequest': {
         if (!latestConfig) throw new Error('Request precedes configuration');
+        if (messages.length) {
+          messages.push({ role: 'user', content: [{ type: 'text', text: continuationText(e.request, e.limits) }], timestamp: e.timestamp });
+          break;
+        }
         messages.push({
           role: 'system', content: '', timestamp: latestConfig.timestamp,
           sections: { preamble: systemPrompt(latestConfig, e.limits), cwd: `<cwd>\n${latestConfig.cwd}\n</cwd>` },
@@ -142,3 +150,5 @@ export function render(agent: InvestigationAgent): Context {
 // Same text the session-based worker sent; the prefix originally kept user data
 // from being treated as an extension slash command.
 export const requestText = (request: Record<string, unknown>) => `Investigation request (task data):\n${JSON.stringify(request, null, 2)}`;
+export const continuationText = (request: Record<string, unknown>, limits: Limits) =>
+  `The caller continues this investigation. Everything above is your own previous work; build on it rather than repeating it, and answer this follow-up with submit_answer. These limits replace the earlier ones.\n\n# Hard limits for this run\n${limitsText(limits)}\n\nFollow-up request (task data):\n${JSON.stringify(request, null, 2)}`;
