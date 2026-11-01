@@ -18,6 +18,16 @@ type Bg = Parameters<Theme['bg']>[0];
 
 const PREVIEW_LINES = 3;
 const LABEL_WIDTH = 8;
+// A semantic colour lane, not another background: existing request/tool/result
+// colours remain intact. The index is stored in the snapshot for session replay.
+const RAIL_COLORS: readonly Fg[] = ['accent', 'warning', 'success', 'mdLink'];
+const RAIL_WIDTH = 2; // one coloured cell and one cell of space
+// Sessions saved before colour lanes existed still get a deterministic rail.
+const legacyRailIndex = (requestId: string) => {
+  let hash = 0;
+  for (const char of requestId) hash = (Math.imul(hash, 31) + char.charCodeAt(0)) >>> 0;
+  return hash % RAIL_COLORS.length;
+};
 
 // Terminal-facing only: never transform model-facing answers or file content.
 export function safeDisplay(value: unknown): string {
@@ -124,30 +134,34 @@ function boxLines(box: Box, open: boolean, style: Style, width: number): Rendere
 // Every step is always shown; opening or closing one box changes only its own height.
 export function renderDisplay(state: DisplayState, width: number, style: Style): Rendered {
   const w = Math.max(20, width);
+  const innerWidth = w - RAIL_WIDTH;
   const view = state.snapshot;
+  const index = view?.railIndex ?? legacyRailIndex(view?.requestId ?? '');
+  const token = RAIL_COLORS[index % RAIL_COLORS.length] ?? RAIL_COLORS[0];
+  const rail = style.fg(token, '▌') + ' ';
   if (!view) {
-    const lines = wrapTextWithAnsi(style.fg(state.final?.failed ? 'error' : 'muted', safeDisplay(state.final?.text || 'Starting investigation…')), w);
-    return { lines, targets: lines.map(() => undefined) };
+    const lines = wrapTextWithAnsi(style.fg(state.final?.failed ? 'error' : 'muted', safeDisplay(state.final?.text || 'Starting investigation…')), innerWidth);
+    return { lines: lines.map(line => rail + line), targets: lines.map(() => undefined) };
   }
   const identity = view.handle ? style.fg('accent', style.bold(view.handle)) : style.fg('toolTitle', style.bold('investigate'));
   // While a run is active the phase says most; once it ends, the agent's status does.
   const phase = ['queued', 'starting', 'running'].includes(view.phase) ? view.phase : view.agentStatus ?? view.phase;
   const facts = [phase, plural(view.turns, 'model request'), state.defaultOpen ? view.model : undefined].filter(Boolean).join(' · ');
-  const lines = [truncateToWidth(`◆ ${identity} ${style.fg('dim', `· ${safeDisplay(facts)}`)}`, w, '…')];
+  const lines = [truncateToWidth(`◆ ${identity} ${style.fg('dim', `· ${safeDisplay(facts)}`)}`, innerWidth, '…')];
   if (view.note && view.phase !== 'running') {
     const color: Fg = view.phase === 'failed' || view.phase === 'cancelled' ? 'error' : 'muted';
-    lines.push(...wrapTextWithAnsi(style.fg(color, safeDisplay(view.note)), w));
+    lines.push(...wrapTextWithAnsi(style.fg(color, safeDisplay(view.note)), innerWidth));
   }
-  if (view.omitted) lines.push(style.fg('dim', truncateToWidth(`  ${plural(view.omitted, 'earlier step')} omitted from bounded UI history`, w, '…')));
+  if (view.omitted) lines.push(style.fg('dim', truncateToWidth(`  ${plural(view.omitted, 'earlier step')} omitted from bounded UI history`, innerWidth, '…')));
   const targets: (Target | undefined)[] = lines.map(() => undefined);
   const boxes = view.steps.map(stepBox);
   if (state.final) boxes.push(resultBox(state.final));
   for (const box of boxes) {
-    const rendered = boxLines(box, isOpen(state, box.id), style, w);
+    const rendered = boxLines(box, isOpen(state, box.id), style, innerWidth);
     lines.push(...rendered.lines);
     targets.push(...rendered.targets);
   }
-  return { lines, targets };
+  return { lines: lines.map(line => rail + line), targets };
 }
 
 // --- Pi edge ---------------------------------------------------------------

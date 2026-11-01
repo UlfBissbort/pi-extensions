@@ -89,7 +89,8 @@ test('the snapshot is bounded, plain data, and reports what it dropped', () => {
   assert.equal(s.omitted + s.steps.length, 201);
   assert.equal(s.steps.at(-1).id, 'turn:200:text', 'newest steps are kept');
   assert.deepEqual(JSON.parse(JSON.stringify(s)), s);
-  const one = snapshot({ ...initRun('r'), phase: 'completed', agent });
+  const one = snapshot({ ...initRun('r', 4), phase: 'completed', agent });
+  assert.equal(one.railIndex, 4, 'the semantic lane survives the snapshot boundary');
   assert.equal(one.handle, `ET.InvestigationAgent('${u(0)}')`);
   assert.equal(one.agentStatus, 'answered');
   assert.equal(one.turns, 2);

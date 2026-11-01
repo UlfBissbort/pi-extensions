@@ -27,6 +27,8 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     while (agents.size > MAX_AGENTS) agents.delete(agents.keys().next().value!);
   };
   let closed = false;
+  // Adjacent calls get different rail colours, including calls running in parallel.
+  let nextRailIndex = 0;
 
   pi.on('before_agent_start', async event => {
     if (event.systemPromptOptions.selectedTools.includes('investigate')) {
@@ -71,7 +73,7 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
       const requestId = randomUUID();
       // One store per investigation. Partial updates are UI data for Pi's tool
       // display, never parent-model transcript messages.
-      const store = createRunStore(requestId, snapshot => onUpdate?.({ content: [], details: { requestId, snapshot } }));
+      const store = createRunStore(requestId, snapshot => onUpdate?.({ content: [], details: { requestId, snapshot } }), nextRailIndex++);
       store.dispatch({ type: 'phase', phase: 'queued', note: 'Waiting for an investigation slot.' });
       let timer: ReturnType<typeof setTimeout> | undefined;
       let release = () => {};

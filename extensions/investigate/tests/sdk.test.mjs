@@ -226,11 +226,13 @@ test('full extension pipeline queues independent calls, returns text/usage, and 
       assert(updates.every(u => u.content.length === 0));
       assert(updates.every(u => u.details.requestId === results[i].details.requestId));
       assert(updates.every(u => u.details.snapshot.requestId === results[i].details.requestId));
+      assert(updates.every(u => u.details.snapshot.railIndex === results[i].details.snapshot.railIndex), 'rail colour stays fixed through streaming and completion');
       assert.equal(updates[0].details.snapshot.phase, 'queued');
       assert.equal(updates.at(-1).details.snapshot.phase, 'completed');
       assert.equal(updates.at(-1).details.snapshot.handle, results[i].details.agent);
     }
     assert.notEqual(results[0].details.requestId, results[1].details.requestId);
+    assert.notEqual(results[0].details.snapshot.railIndex, results[1].details.snapshot.railIndex, 'parallel investigations get distinct colour lanes');
     assert.equal(updatesA[0].details.snapshot.steps.length, 0, 'Published snapshots must not mutate');
     await handlers.session_shutdown();
 

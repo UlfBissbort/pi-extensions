@@ -9,7 +9,7 @@ const { visibleWidth, ScrollView, rgbColor, colorToRgb } = await import(tuiPath)
 
 const long = (tag, n = 8) => Array.from({ length: n }, (_, i) => `line ${tag}.${i}`).join('\n');
 const snapshot = {
-  requestId: 'r1', handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'completed', agentStatus: 'answered', model: 'p/m', turns: 2, omitted: 0,
+  requestId: 'r1', railIndex: 0, handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'completed', agentStatus: 'answered', model: 'p/m', turns: 2, omitted: 0,
   steps: [
     { id: 'run:1:request', kind: 'request', question: 'Where is config loaded?' },
     { id: 'turn:1:text', kind: 'model', text: long('A'), live: false },
@@ -64,7 +64,27 @@ const style = {
 };
 const plain = line => line.replace(/\x1b\[[0-9;]*m/g, '');
 // A box starts with its blank separator line; its header row follows.
-const headRows = ({ lines, targets }) => lines.flatMap((l, i) => i > 0 && targets[i] && lines[i - 1] === '' ? [i] : []);
+const headRows = ({ lines, targets }) => lines.flatMap((l, i) => i > 0 && targets[i] && plain(lines[i - 1]).trim() === '▌' ? [i] : []);
+
+test('a continuous, stable colour rail distinguishes adjacent agents without changing click targets', () => {
+  const colored = { ...style, fg: (color, text) => text === '▌'
+    ? `\x1b[${color === 'accent' ? 31 : color === 'warning' ? 33 : 32}m${text}\x1b[39m`
+    : style.fg(color, text) };
+  const first = renderDisplay(withData(), 60, colored);
+  const secondState = reduceDisplay(withData(), { type: 'snapshot', snapshot: { ...snapshot, railIndex: 1 } })[0];
+  const second = renderDisplay(secondState, 60, colored);
+  assert(first.lines.every(l => l.startsWith('\x1b[31m▌\x1b[39m ')), 'the first rail runs through header, spacers, steps and result');
+  assert(second.lines.every(l => l.startsWith('\x1b[33m▌\x1b[39m ')), 'the next agent has a distinct rail');
+  assert.deepEqual(first.targets, second.targets, 'the rail does not change which step a click targets');
+  assert(first.lines.every(l => visibleWidth(l) <= 60));
+  assert(second.lines.every(l => visibleWidth(l) <= 60));
+  const reloaded = renderDisplay(reduceDisplay(initDisplay(false), { type: 'snapshot', snapshot: JSON.parse(JSON.stringify(secondState.snapshot)) })[0], 60, colored);
+  assert(reloaded.lines.every(l => l.startsWith('\x1b[33m▌\x1b[39m ')), 'the rail survives session replay');
+  const { railIndex: _old, ...oldSnapshot } = snapshot;
+  const oldA = renderDisplay(reduceDisplay(initDisplay(false), { type: 'snapshot', snapshot: { ...oldSnapshot, requestId: 'old-1' } })[0], 60, colored);
+  const oldB = renderDisplay(reduceDisplay(initDisplay(false), { type: 'snapshot', snapshot: { ...oldSnapshot, requestId: 'old-2' } })[0], 60, colored);
+  assert.notEqual(oldA.lines[0].match(/(\x1b\[[0-9;]+m)▌/)?.[1], oldB.lines[0].match(/(\x1b\[[0-9;]+m)▌/)?.[1], 'older session snapshots are assigned stable request-based rails');
+});
 
 test('every step is one coloured box under the agent handle, within the width', () => {
   for (const width of [24, 60, 120]) {
@@ -74,8 +94,8 @@ test('every step is one coloured box under the agent handle, within the width', 
   }
   const rendered = renderDisplay(withData(), 60, style);
   const { lines } = rendered;
-  assert.equal(plain(renderDisplay(withData(), 120, style).lines[0]), "◆ ET.InvestigationAgent('🍃-00000000000000000000') · answered · 2 model requests");
-  assert.deepEqual(headRows(rendered).map(i => [plain(lines[i]).trim().split(/\s+/)[0], Number(lines[i].match(/\x1b\[(4\d)m/)[1])]), [
+  assert.equal(plain(renderDisplay(withData(), 120, style).lines[0]), "▌ ◆ ET.InvestigationAgent('🍃-00000000000000000000') · answered · 2 model requests");
+  assert.deepEqual(headRows(rendered).map(i => [plain(lines[i]).replace(/^▌ /, '').trim().split(/\s+/)[0], Number(lines[i].match(/\x1b\[(4\d)m/)[1])]), [
     ['request', 41], ['model', 42], ['tool', 44], ['tool', 45], ['model', 42], ['submit', 44], ['end', 44], ['result', 44],
   ], 'model and tool steps have different colours; errors stand out; the result is a box too');
   assert(plain(lines.find(l => plain(l).includes('read src/config.mjs (lines 1 onward)'))).includes('✓ 1.2s'));

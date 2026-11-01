@@ -18,7 +18,7 @@ export type StreamingContent = AssistantMessage['content'];
 type Effect = 'model' | 'tools' | 'record';
 
 export type RunState = {
-  requestId: string; phase: Phase; note?: string; model?: string;
+  requestId: string; railIndex: number; phase: Phase; note?: string; model?: string;
   agent?: InvestigationAgent;          // the append-only record; source of truth for facts
   streaming?: StreamingContent;        // partial model response, not yet a fact
   awaiting?: Effect;                   // the effect the edge is performing for this run
@@ -44,7 +44,7 @@ export type RunCommand =
   | { type: 'record'; drafts: EntryDraft[] }
   | { type: 'done' };
 
-export const initRun = (requestId: string): RunState => ({ requestId, phase: 'queued' });
+export const initRun = (requestId: string, railIndex = 0): RunState => ({ requestId, railIndex, phase: 'queued' });
 
 const without = <T extends object, K extends keyof T>(value: T, ...keys: K[]): Omit<T, K> => {
   const copy = { ...value };
@@ -180,7 +180,7 @@ export function steps(agent: InvestigationAgent | undefined, streaming?: Streami
 // details, which Pi stores in the parent session. It holds semantic steps, never
 // display strings or the full record, and is bounded so it stays small.
 export type Snapshot = {
-  requestId: string; handle?: string;
+  requestId: string; railIndex: number; handle?: string;
   phase: Phase; agentStatus?: AgentStatus; note?: string; model?: string;
   turns: number;
   steps: Step[];
@@ -222,7 +222,7 @@ export function snapshot(state: RunState): Snapshot {
   const agent = state.agent;
   const bound = boundSteps(steps(agent, state.streaming));
   return {
-    requestId: state.requestId, phase: state.phase, ...bound,
+    requestId: state.requestId, railIndex: state.railIndex, phase: state.phase, ...bound,
     turns: agent ? turnsInRun(agent) + (state.streaming ? 1 : 0) : 0,
     ...(agent ? { handle: `ET.InvestigationAgent('${agent.__uid}')`, agentStatus: status(agent) } : {}),
     ...(state.note === undefined ? {} : { note: state.note }),

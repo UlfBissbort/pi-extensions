@@ -29,7 +29,7 @@ function fakeTerminal() {
 
 const long = (tag, n = 8) => Array.from({ length: n }, (_, i) => `line ${tag}.${i}`).join('\n');
 const snapshot = {
-  requestId: 'r1', handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'running', agentStatus: 'running', model: 'p/m', turns: 2, omitted: 0,
+  requestId: 'r1', railIndex: 0, handle: "ET.InvestigationAgent('🍃-00000000000000000000')", phase: 'running', agentStatus: 'running', model: 'p/m', turns: 2, omitted: 0,
   steps: [
     { id: 'run:1:request', kind: 'request', question: 'Where is config loaded?' },
     { id: 'turn:1:text', kind: 'model', text: long('A'), live: false },
@@ -66,7 +66,45 @@ function mount({ filler, definition: tool = definition }) {
   return { tui, tool: component, terminal, screen, document, rowOf, click, stop: () => tui.stop() };
 }
 
-const boxCount = lines => lines.filter(l => /^\s*(request|model|tool|submit|host|end)\s/.test(l) || /^\s*result\s+returned to the parent/.test(l)).length;
+const boxCount = lines => lines.filter(l => /^\s*▌\s+(request|model|tool|submit|host|end)\s/.test(l) || /^\s*▌\s+result\s+returned to the parent/.test(l)).length;
+
+test('two adjacent investigations keep distinct rails and independent open state in the real TUI', () => {
+  const terminal = fakeTerminal();
+  const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+  setTui(tui);
+  const mounted = index => {
+    const component = new ToolExecutionComponent('investigate', `call-${index}`, { question: 'Where?' }, {}, definition, tui, '/w');
+    const details = { snapshot: { ...snapshot, requestId: `request-${index}`, railIndex: index,
+      handle: `ET.InvestigationAgent('🍃-${index}')`, steps: [snapshot.steps[0], snapshot.steps[2]] } };
+    tui.addChild(component);
+    component.markExecutionStarted();
+    component.updateResult({ content: [], details, isError: false }, true);
+    return component;
+  };
+  const first = mounted(0), second = mounted(1);
+  tui.start();
+  try {
+    tui.renderNow(true);
+    const railAnsi = component => {
+      const lines = component.render(COLUMNS).filter(l => l.includes('▌'));
+      const colors = lines.map(l => l.match(/(\x1b\[[0-9;]+m)▌/)?.[1]);
+      assert(colors.length > 4 && colors.every(c => c === colors[0]), 'the rail is continuous through this call');
+      return colors[0];
+    };
+    const a = railAnsi(first), b = railAnsi(second);
+    assert(a && b && a !== b, 'the two agents have distinct theme colours');
+    const screen = tui.getScreenLines().map(plain);
+    const row = screen.findIndex(l => l.includes('read src/config.mjs'));
+    assert(row >= 0);
+    terminal.input(`\x1b[<0;10;${row + 1}M`);
+    terminal.input(`\x1b[<0;10;${row + 1}m`);
+    tui.renderNow();
+    assert(first.render(COLUMNS).map(plain).some(l => l.includes('read contents')));
+    assert(!second.render(COLUMNS).map(plain).some(l => l.includes('read contents')), 'the other agent stays closed');
+    assert.equal(railAnsi(first), a);
+    assert.equal(railAnsi(second), b);
+  } finally { tui.stop(); }
+});
 
 test('clicking a box in the real TUI opens only that box and keeps it in place', () => {
   const ui = mount({ filler: 40 });
@@ -81,13 +119,13 @@ test('clicking a box in the real TUI opens only that box and keeps it in place',
     // A closed box previews its last lines; its header is four rows above the last one.
     const row = ui.rowOf('line B.7');
     const head = row - 4;
-    assert.match(before[head], /^\s*model\s.*▸/);
+    assert.match(before[head], /^\s*▌\s+model\s.*▸/);
     ui.click(row);
     const after = ui.screen();
     assert.equal(ui.tool.expanded, false, "Pi's expand toggle never fired");
     assert.equal(boxCount(ui.document()), boxes, 'the number of boxes is unchanged');
     assert.equal(ui.tui.viewportTop, initialTop, 'the transcript did not move');
-    assert.match(after[head], /^\s*model\s.*▾/, 'the box header keeps its screen row');
+    assert.match(after[head], /^\s*▌\s+model\s.*▾/, 'the box header keeps its screen row');
     assert.deepEqual(after.slice(0, head), before.slice(0, head), 'everything above the box is unchanged');
     assert(after.some(l => l.includes('line B.0')), 'B opened');
 
@@ -130,7 +168,7 @@ test('the open state survives new data, and only the clicked box changes when sc
     ui.click(head);
     assert.equal(ui.tui.viewportTop, top, 'the transcript did not move');
     assert.deepEqual(ui.screen().slice(0, head), above.slice(0, head), 'everything above the box is unchanged');
-    assert.match(ui.screen()[head], /^\s*model\s.*▾/, 'the box header keeps its screen row');
+    assert.match(ui.screen()[head], /^\s*▌\s+model\s.*▾/, 'the box header keeps its screen row');
     assert(ui.screen().some(l => l.includes('line A.0')));
     assert.equal(ui.tool.expanded, false);
   } finally { ui.stop(); }
@@ -140,13 +178,13 @@ test("clicking the chain header is Pi's expand toggle: everything opens, no box 
   const ui = mount({ filler: 0 });
   try {
     const boxes = boxCount(ui.document());
-    ui.click(ui.rowOf('ET.InvestigationAgent'), 5);
+    ui.click(ui.rowOf('ET.InvestigationAgent'), 9);
     assert.equal(ui.tool.expanded, true);
     const open = ui.document();
     assert.equal(boxCount(open), boxes);
     assert(open.some(l => l.includes('line A.0')) && open.some(l => l.includes('line B.0')));
     // A second click on the same word within 500 ms is Pi's double-click: it selects the word.
-    ui.click(ui.rowOf('ET.InvestigationAgent'), 5);
+    ui.click(ui.rowOf('ET.InvestigationAgent'), 9);
     assert.equal(ui.tool.expanded, true);
     ui.click(ui.rowOf('ET.InvestigationAgent'), 40);
     assert.equal(ui.tool.expanded, false);
@@ -208,7 +246,7 @@ test('a step opened while streaming stays open once recorded, through the whole 
     await midStream;
     await new Promise(resolve => setTimeout(resolve, 150));   // streamed publishes are coalesced
     const live = ui.document();
-    assert(live.some(l => /^\s*model\s.*… ▸/.test(l)), 'the streaming response is a closed, live box');
+    assert(live.some(l => /^\s*▌\s+model\s.*… ▸/.test(l)), 'the streaming response is a closed, live box');
     const boxes = boxCount(live);
     ui.click(ui.rowOf('ls .'));
     assert(ui.document().some(l => l.includes('waiting for result')), 'tool call can be opened before the result arrives');
@@ -222,15 +260,15 @@ test('a step opened while streaming stays open once recorded, through the whole 
     ui.tui.renderNow();
     const final = ui.document();
     assert(final.some(l => l.includes('line S.0')), 'still open once the response is recorded');
-    assert(final.some(l => /^\s*tool\s+ls \. .*✓/.test(l)), 'the streamed tool call resolved in place');
+    assert(final.some(l => /^\s*▌\s+tool\s+ls \. .*✓/.test(l)), 'the streamed tool call resolved in place');
     const resolved = result.details.snapshot.steps.find(s => s.kind === 'tool' && s.name === 'ls');
     assert(resolved.resultText && resolved.outcome === 'ok');
     assert(final.some(l => l.includes('"path": "."')), 'call arguments updated from the provider');
     assert(final.some(l => l.includes(resolved.resultText.split('\n').find(Boolean).slice(0, 20))), 'the open tool shows its actual result after recording');
     assert(boxCount(final) > boxes, 'boxes were only added');
-    assert(final.some(l => /^\s*result\s+returned to the parent/.test(l)));
+    assert(final.some(l => /^\s*▌\s+result\s+returned to the parent/.test(l)));
     assert.equal(ui.tool.expanded, false);
-  } finally { ui.stop(); }
+  } finally { resume(); ui.stop(); }
 });
 
 // Pi's regular (non-fullscreen) mode: no mouse routing and no primary scroll view.
