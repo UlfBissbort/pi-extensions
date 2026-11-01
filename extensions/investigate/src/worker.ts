@@ -115,7 +115,9 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
       transport: 'auto', timeoutMs: 300000, maxRetries: 0, maxRetryDelayMs: 60000,
     } as any);
     for await (const event of stream) {
-      if ('partial' in event) dispatch({ type: 'streamed', content: event.partial.content });
+      // Pi's partial is one live object it keeps mutating; the state gets a copy.
+      // Blocks are copied shallowly: providers replace arguments, never mutate them.
+      if ('partial' in event) dispatch({ type: 'streamed', content: event.partial.content.map(block => ({ ...block })) });
     }
     const message = await stream.result();
     const { role: _role, ...fields } = message;

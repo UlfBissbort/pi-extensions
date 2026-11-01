@@ -41,15 +41,15 @@ const snapshot = {
 const definition = { name: 'investigate', label: 'Investigate', renderShell: 'self', renderCall: renderInvestigationCall, renderResult: renderInvestigationResult };
 const plain = line => line.replace(/\x1b\][^\x07]*\x07|\x1b\[[0-9;?]*[A-Za-z]/g, '');
 
-function mount({ filler }) {
+function mount({ filler, definition: tool = definition }) {
   const terminal = fakeTerminal();
   const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
   setTui(tui);   // as the extension's empty below-editor widget does
   tui.addChild(new Text(Array.from({ length: filler }, (_, i) => `transcript ${i}`).join('\n'), 0, 0));
-  const tool = new ToolExecutionComponent('investigate', 'call-1', { question: 'Where is config loaded?' }, {}, definition, tui, '/w');
-  tui.addChild(tool);
-  tool.markExecutionStarted();
-  tool.updateResult({ content: [], details: { snapshot }, isError: false }, true);
+  const component = new ToolExecutionComponent('investigate', 'call-1', { question: 'Where is config loaded?' }, {}, tool, tui, '/w');
+  tui.addChild(component);
+  component.markExecutionStarted();
+  if (tool === definition) component.updateResult({ content: [], details: { snapshot }, isError: false }, true);
   tui.start();
   tui.renderNow(true);
   const screen = () => tui.getScreenLines().map(plain);
@@ -62,8 +62,8 @@ function mount({ filler }) {
     tui.renderNow();
   };
   // The whole tool display, including lines scrolled out of view.
-  const document = () => tool.render(COLUMNS).map(plain);
-  return { tui, tool, terminal, screen, document, rowOf, click, stop: () => tui.stop() };
+  const document = () => component.render(COLUMNS).map(plain);
+  return { tui, tool: component, terminal, screen, document, rowOf, click, stop: () => tui.stop() };
 }
 
 const boxCount = lines => lines.filter(l => /^\s*(request|model|tool|submit|host|end|result)\s/.test(l)).length;
@@ -146,4 +146,94 @@ test("clicking the chain header is Pi's expand toggle: everything opens, no box 
     assert.equal(ui.tool.expanded, false);
     assert(!ui.document().some(l => l.includes('line A.0')));
   } finally { ui.stop(); }
+});
+
+// The whole pipeline: the extension runs a scripted model that streams like a
+// real provider (one live partial object, mutated in place); every onUpdate goes
+// into Pi's tool display, and the user clicks while the response is streaming.
+test('a step opened while streaming stays open once recorded, through the whole extension', async () => {
+  const { registerInvestigation } = await jiti.import('../src/extension.ts');
+  const { loadConfig } = await import('../src/config.mjs');
+  const { zeroUsage } = await import('../src/core.mjs');
+  const { ModelRuntime } = await import(`${host}/dist/index.js`);
+  const { createAssistantMessageEventStream } = await import(`${host}/node_modules/@earendil-works/pi-ai/dist/index.js`);
+  const root = new URL('../', import.meta.url).pathname;
+  const { config } = await loadConfig(root);
+  let resume;
+  const paused = new Promise(resolve => { resume = resolve; });
+  let streaming;
+  const midStream = new Promise(resolve => { streaming = resolve; });
+  const createRuntime = async () => {
+    const runtime = await ModelRuntime.create({ refreshOnCreate: false });
+    const model = runtime.getModel(config.provider, config.model);
+    runtime.getAvailable = async () => [model];
+    let turn = 0;
+    runtime.streamSimple = () => {
+      const stream = createAssistantMessageEventStream();
+      const n = turn++;
+      const output = { role: 'assistant', content: [], api: model.api, provider: model.provider, model: model.id, usage: { ...zeroUsage(), input: 10 }, stopReason: 'toolUse', timestamp: n };
+      (async () => {
+        stream.push({ type: 'start', partial: output });
+        if (n === 0) {
+          output.content.push({ type: 'text', text: '' });
+          for (const line of long('S').split('\n')) {
+            output.content[0].text += `${line}\n`;
+            stream.push({ type: 'text_delta', contentIndex: 0, delta: line, partial: output });
+          }
+          output.content.push({ type: 'toolCall', id: 'call_1|fc_1', name: 'ls', arguments: {} });
+          stream.push({ type: 'toolcall_start', contentIndex: 1, partial: output });
+          streaming();
+          await paused;
+          output.content[1].arguments = { path: '.' };
+        } else output.content.push({ type: 'toolCall', id: 'call_2|fc_2', name: 'submit_answer', arguments: { text: 'All done.' } });
+        stream.push({ type: 'done', reason: 'toolUse', message: output });
+        stream.end(output);
+      })();
+      return stream;
+    };
+    return runtime;
+  };
+  const tools = [];
+  await registerInvestigation({ on: () => {}, registerTool: tool => tools.push(tool) }, root, { createRuntime });
+  const [investigate] = tools;
+  const ui = mount({ filler: 0, definition: { ...definition, renderCall: investigate.renderCall, renderResult: investigate.renderResult } });
+  try {
+    const done = investigate.execute('call-1', { question: 'Q' }, undefined, update => { ui.tool.updateResult(update, true); ui.tui.renderNow(); }, { cwd: root });
+    await midStream;
+    await new Promise(resolve => setTimeout(resolve, 150));   // streamed publishes are coalesced
+    const live = ui.document();
+    assert(live.some(l => /^\s*model\s.*… ▸/.test(l)), 'the streaming response is a closed, live box');
+    const boxes = boxCount(live);
+    ui.click(ui.rowOf('line S.7'));
+    assert(ui.document().some(l => l.includes('line S.0')), 'opened while streaming');
+
+    resume();
+    const result = await done;
+    assert(!result.isError, result.content[0].text);
+    ui.tool.updateResult(result, false);
+    ui.tui.renderNow();
+    const final = ui.document();
+    assert(final.some(l => l.includes('line S.0')), 'still open once the response is recorded');
+    assert(final.some(l => /^\s*tool\s+ls \. .*✓/.test(l)), 'the streamed tool call resolved in place');
+    assert(boxCount(final) > boxes, 'boxes were only added');
+    assert(final.some(l => /^\s*result\s+returned to the parent/.test(l)));
+    assert.equal(ui.tool.expanded, false);
+  } finally { ui.stop(); }
+});
+
+// Pi's regular (non-fullscreen) mode: no mouse routing and no primary scroll view.
+test('in the regular TUI the chain renders the same, and the scroll hold is a no-op', async () => {
+  const { TuiMainScreen } = await import(tuiPath);
+  const tui = new TuiMainScreen(fakeTerminal());
+  setTui(tui);
+  const component = new ToolExecutionComponent('investigate', 'call-1', { question: 'Q' }, {}, definition, tui, '/w');
+  tui.addChild(component);
+  component.markExecutionStarted();
+  component.updateResult({ content: [], details: { snapshot }, isError: false }, true);
+  const lines = component.render(COLUMNS).map(plain);
+  assert.equal(boxCount(lines), 5);
+  assert(lines.every(l => l.length <= COLUMNS));
+  // Toggle via Pi's expand flag, which runs the holdScroll command without a scroll view.
+  component.setExpanded(true);
+  assert(component.render(COLUMNS).map(plain).some(l => l.includes('line A.0')));
 });
