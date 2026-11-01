@@ -20,6 +20,7 @@ const jiti = createJiti(import.meta.url, {
 });
 const { runInvestigation, isolatedResources } = await jiti.import('../src/worker.ts');
 const { registerInvestigation } = await jiti.import('../src/extension.ts');
+const { steps } = await jiti.import('../src/run.ts');
 const { ModelRuntime, createAgentSession, SessionManager, SettingsManager } = await import(`${host}/dist/index.js`);
 const { createAssistantMessageEventStream } = await import(`${host}/node_modules/@earendil-works/pi-ai/dist/index.js`);
 const { convertResponsesMessages } = await import(`${host}/node_modules/@earendil-works/pi-ai/dist/api/openai-responses-shared.js`);
@@ -92,6 +93,9 @@ test('real SDK loop reads fixture, keeps intermediate commentary private, and su
     assert(result.text.includes('Final answer.'));
     assert(result.text.includes('  "actual" & <source>\n'));
     assert(!result.text.includes('INTERMEDIATE_NOT_FOR_PARENT'));
+    const readStep = steps(result.agent).find(s => s.kind === 'tool' && s.name === 'read');
+    assert.deepEqual(JSON.parse(readStep.argumentsText), { path });
+    assert(readStep.resultText.includes('  "actual" & <source>'), 'the call and model-visible tool output are in one step');
     const first = JSON.stringify(capture[0].context);
     assert(!first.includes('Work directly; do not delegate'));
     assert(!first.includes('PARENT_HISTORY_SENTINEL'));

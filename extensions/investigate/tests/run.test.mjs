@@ -34,13 +34,37 @@ test('steps are a pure, private view of the record with ids from what each step 
     ['turn:2:call:c', 'submit', 'ok'],
     ['run:1:end', 'end', 'submitted'],
   ]);
-  assert.deepEqual(s[2], { id: 'turn:1:call:a', kind: 'tool', name: 'read', args: { path: 'src/config.mjs' }, outcome: 'ok', live: false, durationMs: 1200 });
-  assert.equal(s[3].error, 'grep failed');
+  assert.deepEqual(s[2], { id: 'turn:1:call:a', kind: 'tool', name: 'read', args: { path: 'src/config.mjs' }, argumentsText: '{\n  "path": "src/config.mjs"\n}', resultText: 'raw output', outcome: 'ok', live: false, durationMs: 1200 });
+  assert.equal(s[3].resultText, 'grep failed');
   assert.deepEqual([s[4].answer, s[4].excerpts], ['In loadConfig.', 1]);
   const text = JSON.stringify(s);
   assert(!text.includes('SECRET_REASONING'), 'thinking is never shown');
-  assert(!text.includes('raw output'), 'successful tool output is not shown');
+  assert(text.includes('raw output'), 'successful tool output is available to the expandable UI');
   assert.deepEqual(steps(JSON.parse(JSON.stringify(agent))), s, 'same data, same steps');
+});
+
+test('tool steps keep the supplied arguments and model-visible results without copying image bytes', () => {
+  const args = { path: '/tmp/file', options: { nested: [1, 'two'] }, limit: 5 };
+  const callEntry = response(3, [call('read', args, 'a'), call('bash', { command: 'false' }, 'b')]);
+  const textResult = { ...result(4, 'a', 'read'), content: [
+    { type: 'text', text: 'first\n  indented' },
+    { type: 'image', mimeType: 'image/png', data: 'PRIVATE_IMAGE_BYTES' },
+    { type: 'text', text: 'last' },
+  ] };
+  const failed = result(5, 'b', 'bash', true, 'permission denied');
+  const recorded = { ...started, context_: [...started.context_, callEntry, textResult, failed] };
+  const [read, bash] = steps(recorded).slice(1);
+  assert.deepEqual(JSON.parse(read.argumentsText), args, 'nested arguments are represented');
+  assert.equal(read.resultText, 'first\n  indented\n[image content omitted from text display]\nlast');
+  assert.equal(bash.resultText, 'permission denied');
+  assert(!JSON.stringify(snapshot({ ...initRun('r'), agent: recorded })).includes('PRIVATE_IMAGE_BYTES'), 'image bytes do not enter the parent session');
+  const long = { ...started, context_: [...started.context_, response(3, [call('read', { path: 'x'.repeat(30000) }, 'big')]),
+    { ...result(4, 'big', 'read'), content: [{ type: 'text', text: 'y'.repeat(30000) }] }] };
+  const bounded = snapshot({ ...initRun('r'), agent: long });
+  const step = bounded.steps.at(-1);
+  assert(step.argumentsText.length <= 6000 && step.resultText.length <= 6000);
+  assert(bounded.steps.reduce((n, s) => n + stepSize(s), 0) <= MAX_TOTAL_TEXT);
+  assert(!JSON.stringify(bounded).includes('y'.repeat(30000)));
 });
 
 test('a step keeps its id from streaming to recorded', () => {

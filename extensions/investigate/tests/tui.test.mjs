@@ -33,9 +33,9 @@ const snapshot = {
   steps: [
     { id: 'run:1:request', kind: 'request', question: 'Where is config loaded?' },
     { id: 'turn:1:text', kind: 'model', text: long('A'), live: false },
-    { id: 'turn:1:call:a', kind: 'tool', name: 'read', args: { path: 'src/config.mjs' }, outcome: 'ok', live: false, durationMs: 1200 },
+    { id: 'turn:1:call:a', kind: 'tool', name: 'read', args: { path: 'src/config.mjs' }, argumentsText: '{\n  "path": "src/config.mjs"\n}', resultText: 'read contents', outcome: 'ok', live: false, durationMs: 1200 },
     { id: 'turn:2:text', kind: 'model', text: long('B'), live: false },
-    { id: 'turn:2:call:b', kind: 'tool', name: 'ls', args: { path: '.' }, outcome: 'pending', live: false },
+    { id: 'turn:2:call:b', kind: 'tool', name: 'ls', args: { path: '.' }, argumentsText: '{\n  "path": "."\n}', outcome: 'pending', live: false },
   ],
 };
 const definition = { name: 'investigate', label: 'Investigate', renderShell: 'self', renderCall: renderInvestigationCall, renderResult: renderInvestigationResult };
@@ -66,13 +66,14 @@ function mount({ filler, definition: tool = definition }) {
   return { tui, tool: component, terminal, screen, document, rowOf, click, stop: () => tui.stop() };
 }
 
-const boxCount = lines => lines.filter(l => /^\s*(request|model|tool|submit|host|end|result)\s/.test(l)).length;
+const boxCount = lines => lines.filter(l => /^\s*(request|model|tool|submit|host|end)\s/.test(l) || /^\s*result\s+returned to the parent/.test(l)).length;
 
 test('clicking a box in the real TUI opens only that box and keeps it in place', () => {
   const ui = mount({ filler: 40 });
   try {
     assert.equal(ui.tui.isFollowingOutput, true, 'the transcript is at its end');
     const before = ui.screen();
+    const initialTop = ui.tui.viewportTop;
     const boxes = boxCount(ui.document());
     assert.equal(boxes, 5);
     assert(before.some(l => l.includes('… 5 more lines')) && !before.some(l => l.includes('line B.0')));
@@ -85,17 +86,22 @@ test('clicking a box in the real TUI opens only that box and keeps it in place',
     const after = ui.screen();
     assert.equal(ui.tool.expanded, false, "Pi's expand toggle never fired");
     assert.equal(boxCount(ui.document()), boxes, 'the number of boxes is unchanged');
-    assert.equal(ui.tui.viewportTop, 37, 'the transcript did not move');
+    assert.equal(ui.tui.viewportTop, initialTop, 'the transcript did not move');
     assert.match(after[head], /^\s*model\s.*▾/, 'the box header keeps its screen row');
     assert.deepEqual(after.slice(0, head), before.slice(0, head), 'everything above the box is unchanged');
     assert(after.some(l => l.includes('line B.0')), 'B opened');
 
-    // A short box and a separator line claim the click too, and change nothing.
-    ui.click(ui.rowOf('read src/config.mjs'));
+    // A single click opens the call and result together, without changing B's state.
+    const readHead = ui.rowOf('read src/config.mjs');
+    ui.click(readHead);
     assert.equal(ui.tool.expanded, false);
-    ui.click(ui.rowOf('read src/config.mjs') - 1);
-    assert.equal(ui.tool.expanded, false);
-    assert.deepEqual(ui.screen(), after, 'clicks that change nothing leave the screen as it was');
+    assert.equal(ui.tui.viewportTop, initialTop);
+    assert(ui.document().some(l => l.includes('read contents')));
+    assert(ui.document().some(l => l.includes('"path": "src/config.mjs"')));
+    assert(ui.document().some(l => l.includes('line B.0')), 'opening read leaves B open');
+    assert.equal(boxCount(ui.document()), boxes);
+    ui.click(ui.rowOf('read contents'), 35);
+    assert.deepEqual(ui.screen(), after, 'one click on the result closes its call without closing B');
 
     // Clicking B's header closes it: the screen returns to exactly what it was.
     ui.click(head, 30);
@@ -204,8 +210,10 @@ test('a step opened while streaming stays open once recorded, through the whole 
     const live = ui.document();
     assert(live.some(l => /^\s*model\s.*… ▸/.test(l)), 'the streaming response is a closed, live box');
     const boxes = boxCount(live);
+    ui.click(ui.rowOf('ls .'));
+    assert(ui.document().some(l => l.includes('waiting for result')), 'tool call can be opened before the result arrives');
     ui.click(ui.rowOf('line S.7'));
-    assert(ui.document().some(l => l.includes('line S.0')), 'opened while streaming');
+    assert(ui.document().some(l => l.includes('line S.0')), 'model step opened while streaming');
 
     resume();
     const result = await done;
@@ -215,6 +223,10 @@ test('a step opened while streaming stays open once recorded, through the whole 
     const final = ui.document();
     assert(final.some(l => l.includes('line S.0')), 'still open once the response is recorded');
     assert(final.some(l => /^\s*tool\s+ls \. .*✓/.test(l)), 'the streamed tool call resolved in place');
+    const resolved = result.details.snapshot.steps.find(s => s.kind === 'tool' && s.name === 'ls');
+    assert(resolved.resultText && resolved.outcome === 'ok');
+    assert(final.some(l => l.includes('"path": "."')), 'call arguments updated from the provider');
+    assert(final.some(l => l.includes(resolved.resultText.split('\n').find(Boolean).slice(0, 20))), 'the open tool shows its actual result after recording');
     assert(boxCount(final) > boxes, 'boxes were only added');
     assert(final.some(l => /^\s*result\s+returned to the parent/.test(l)));
     assert.equal(ui.tool.expanded, false);

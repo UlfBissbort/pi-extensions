@@ -119,12 +119,15 @@ export type Outcome = 'pending' | 'ok' | 'error';
 export type Step =
   | { id: StepId; kind: 'request'; question: string }
   | { id: StepId; kind: 'model'; text: string; live: boolean }
-  | { id: StepId; kind: 'tool'; name: string; args: Record<string, unknown>; outcome: Outcome; live: boolean; error?: string; durationMs?: number }
+  | { id: StepId; kind: 'tool'; name: string; args: Record<string, unknown>; argumentsText: string; resultText?: string; outcome: Outcome; live: boolean; durationMs?: number }
   | { id: StepId; kind: 'submit'; answer: string; excerpts: number; outcome: Outcome; live: boolean; error?: string }
   | { id: StepId; kind: 'host'; text: string }
   | { id: StepId; kind: 'end'; reason: RunEndReason; message?: string };
 
-const textOf = (content: ToolResult['content']) => content.map(c => c.type === 'text' ? c.text : '').join('\n');
+// The terminal can show the model-visible text blocks. Never persist image data
+// in the parent's UI snapshot: identify non-text blocks without copying their bytes.
+const resultText = (content: ToolResult['content']) => content.map(c =>
+  c.type === 'text' ? c.text : `[${c.type} content omitted from text display]`).join('\n') || '[empty result]';
 // Only the arguments a step title can show; values are primitives.
 const plainArgs = (args: Record<string, unknown> = {}) =>
   Object.fromEntries(Object.entries(args).filter(([, v]) => ['string', 'number', 'boolean'].includes(typeof v)));
@@ -140,7 +143,7 @@ function responseSteps(turn: number, content: StreamingContent, live: boolean): 
     const args = block.arguments ?? {};
     out.push(block.name === SUBMIT
       ? { id, kind: 'submit', answer: typeof args.text === 'string' ? args.text : '', excerpts: Array.isArray(args.excerpts) ? args.excerpts.length : 0, outcome: 'pending', live }
-      : { id, kind: 'tool', name: block.name, args: plainArgs(args), outcome: 'pending', live });
+      : { id, kind: 'tool', name: block.name, args: plainArgs(args), argumentsText: JSON.stringify(args, null, 2), outcome: 'pending', live });
   });
   return out;
 }
@@ -159,8 +162,10 @@ export function steps(agent: InvestigationAgent | undefined, streaming?: Streami
         while (i >= 0 && out[i].id !== id) i--;
         const s = out[i];
         if (s?.kind !== 'tool' && s?.kind !== 'submit') break;
-        const outcome = { outcome: e.isError ? 'error' as const : 'ok' as const, ...(e.isError ? { error: textOf(e.content) } : {}) };
-        out[i] = s.kind === 'submit' ? { ...s, ...outcome } : { ...s, ...outcome, ...(e.durationMs === undefined ? {} : { durationMs: e.durationMs }) };
+        const outcome = { outcome: e.isError ? 'error' as const : 'ok' as const };
+        out[i] = s.kind === 'submit'
+          ? { ...s, ...outcome, ...(e.isError ? { error: resultText(e.content) } : {}) }
+          : { ...s, ...outcome, resultText: resultText(e.content), ...(e.durationMs === undefined ? {} : { durationMs: e.durationMs }) };
         break;
       }
       case 'ET.HostInstruction': out.push({ id: e.__uid, kind: 'host', text: e.content }); break;
@@ -194,7 +199,7 @@ function boundStep(s: Step): Step {
   switch (s.kind) {
     case 'request': return { ...s, question: bounded(s.question) };
     case 'model': case 'host': return { ...s, text: bounded(s.text) };
-    case 'tool': return { ...s, args: Object.fromEntries(Object.entries(s.args).map(([k, v]) => [k, typeof v === 'string' ? bounded(v, MAX_ARG_TEXT) : v])), ...(s.error === undefined ? {} : { error: bounded(s.error) }) };
+    case 'tool': return { ...s, args: Object.fromEntries(Object.entries(s.args).map(([k, v]) => [k, typeof v === 'string' ? bounded(v, MAX_ARG_TEXT) : v])), argumentsText: bounded(s.argumentsText), ...(s.resultText === undefined ? {} : { resultText: bounded(s.resultText) }) };
     case 'submit': return { ...s, answer: bounded(s.answer), ...(s.error === undefined ? {} : { error: bounded(s.error) }) };
     case 'end': return s.message === undefined ? s : { ...s, message: bounded(s.message) };
   }

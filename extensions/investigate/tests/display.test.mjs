@@ -5,7 +5,7 @@ import { jiti, tuiPath } from './jiti.mjs';
 const { initDisplay, reduceDisplay, reduceAll, isOpen, eventsFromRender, RESULT_ID } = await jiti.import('../src/display.ts');
 const { renderDisplay, renderInvestigationCall, renderInvestigationResult } = await jiti.import('../src/render.ts');
 const { holdScroll } = await jiti.import('../src/scroll.ts');
-const { visibleWidth, ScrollView } = await import(tuiPath);
+const { visibleWidth, ScrollView, rgbColor, colorToRgb } = await import(tuiPath);
 
 const long = (tag, n = 8) => Array.from({ length: n }, (_, i) => `line ${tag}.${i}`).join('\n');
 const snapshot = {
@@ -13,8 +13,8 @@ const snapshot = {
   steps: [
     { id: 'run:1:request', kind: 'request', question: 'Where is config loaded?' },
     { id: 'turn:1:text', kind: 'model', text: long('A'), live: false },
-    { id: 'turn:1:call:a', kind: 'tool', name: 'read', args: { path: 'src/config.mjs' }, outcome: 'ok', live: false, durationMs: 1200 },
-    { id: 'turn:1:call:b', kind: 'tool', name: 'grep', args: { pattern: 'local', path: '.' }, outcome: 'error', live: false, error: 'grep failed' },
+    { id: 'turn:1:call:a', kind: 'tool', name: 'read', args: { path: 'src/config.mjs' }, argumentsText: '{\n  "path": "src/config.mjs"\n}', resultText: 'read output', outcome: 'ok', live: false, durationMs: 1200 },
+    { id: 'turn:1:call:b', kind: 'tool', name: 'grep', args: { pattern: 'local', path: '.' }, argumentsText: '{\n  "pattern": "local",\n  "path": "."\n}', resultText: 'grep failed', outcome: 'error', live: false },
     { id: 'turn:2:text', kind: 'model', text: long('B'), live: false },
     { id: 'turn:2:call:c', kind: 'submit', answer: 'In loadConfig.', excerpts: 1, outcome: 'ok', live: false },
     { id: 'run:1:end', kind: 'end', reason: 'submitted' },
@@ -59,6 +59,8 @@ const style = {
   fg: (_c, t) => `\x1b[36m${t}\x1b[39m`,
   bg: (c, t) => `\x1b[${BG[c]}m${t}\x1b[49m`,
   bold: t => `\x1b[1m${t}\x1b[22m`,
+  colors: { toolSuccessBg: rgbColor(0, 80, 0), customMessageBg: rgbColor(0, 20, 0) },
+  style: (t, { bg }) => { const { g } = colorToRgb(bg); assert(g > 20 && g < 80, 'a distinct, nearby green from the theme'); return `\x1b[46m${t}\x1b[49m`; },
 };
 const plain = line => line.replace(/\x1b\[[0-9;]*m/g, '');
 // A box starts with its blank separator line; its header row follows.
@@ -77,11 +79,35 @@ test('every step is one coloured box under the agent handle, within the width', 
     ['request', 41], ['model', 42], ['tool', 44], ['tool', 45], ['model', 42], ['submit', 44], ['end', 44], ['result', 44],
   ], 'model and tool steps have different colours; errors stand out; the result is a box too');
   assert(plain(lines.find(l => plain(l).includes('read src/config.mjs (lines 1 onward)'))).includes('✓ 1.2s'));
-  assert(lines.some(l => plain(l).includes('grep failed')), 'tool errors are shown');
+  assert(!lines.some(l => plain(l).includes('grep failed') || plain(l).includes('read output')), 'tool results stay closed by default');
   assert(lines.some(l => plain(l).includes('… 5 more lines')) && !lines.some(l => plain(l).includes('line A.0')), 'long steps start closed with a preview');
   assert(lines.some(l => plain(l).includes('line R.5')) && !lines.some(l => plain(l).includes('line R.0')), 'so does the result');
   const failed = renderDisplay(reduceDisplay(withData(), { type: 'final', text: 'boom', failed: true })[0], 60, style).lines;
   assert(failed.find(l => plain(l).includes('returned to the parent')).includes('\x1b[45m'), 'failures use the error colour');
+});
+
+test('a single open tool box contains arguments and a separately shaded result; errors remain connected', () => {
+  const before = renderDisplay(withData(), 80, style);
+  assert(!plain(before.lines.join('\n')).includes('read output') && !plain(before.lines.join('\n')).includes('grep failed'));
+  const [opened] = reduceDisplay(withData(), { type: 'toggle', id: 'turn:1:call:a' });
+  const after = renderDisplay(opened, 80, style);
+  assert.equal(headRows(after).length, headRows(before).length, 'opening does not add another box');
+  const callRow = after.lines.findIndex(l => plain(l).includes('read src/config.mjs'));
+  const resultRow = after.lines.findIndex(l => plain(l).includes('read output'));
+  assert(after.lines[callRow].includes('\x1b[44m'));
+  assert(after.lines[resultRow].includes('\x1b[46m'), 'successful result uses another theme-derived shade');
+  assert(resultRow > callRow && resultRow < after.lines.findIndex(l => plain(l).includes('grep local')));
+  assert(after.lines.some(l => plain(l).includes('"path": "src/config.mjs"')));
+  assert(after.targets[resultRow].id === 'turn:1:call:a' && after.targets[resultRow].toggles, 'clicking the result closes its call');
+  assert(!after.lines.some(l => plain(l).includes('grep failed')), 'a second tool remains closed');
+  const [failed] = reduceDisplay(opened, { type: 'toggle', id: 'turn:1:call:b' });
+  const error = renderDisplay(failed, 80, style);
+  assert(error.lines.find(l => plain(l).includes('grep failed')).includes('\x1b[45m'), 'error result uses the error shade');
+  assert(error.targets[error.lines.findIndex(l => plain(l).includes('grep failed'))].id === 'turn:1:call:b');
+  assert(error.lines.every(l => visibleWidth(l) <= 80));
+  const legacy = { ...snapshot, steps: [{ id: 'old', kind: 'tool', name: 'read', args: { path: 'old.txt' }, error: 'old error', outcome: 'error', live: false }] };
+  const old = renderDisplay(reduceAll(initDisplay(true), [{ type: 'snapshot', snapshot: legacy }])[0], 60, style);
+  assert(old.lines.some(l => plain(l).includes('old error')), 'previously persisted tool snapshots still render');
 });
 
 test('opening a step changes only its own height; box count and lines above it stay', () => {
@@ -96,7 +122,7 @@ test('opening a step changes only its own height; box count and lines above it s
   // Every line of every box is a click target; short boxes are targets that change nothing.
   const boxLines = before.targets.slice(before.targets.findIndex(Boolean));
   assert(boxLines.every(Boolean));
-  assert.equal(before.targets.find(t => t?.id === 'turn:1:call:a').toggles, false);
+  assert.equal(before.targets.find(t => t?.id === 'turn:1:call:a' && t.toggles)?.toggles, true);
   assert.equal(before.targets.find(t => t?.id === 'turn:1:text' && t.toggles)?.toggles, true);
   assert.equal(before.targets[0], undefined, 'the chain header is left to Pi');
 });
@@ -128,9 +154,12 @@ test('Pi renderers: the call until execution starts, then the chain; clicks togg
   assert(shows('line A.0') && !shows('line B.0'), 'only A opens');
   assert.equal(invalidated, 1);
   lines = component.render(60);
-  assert.deepEqual(click(row('read src/config.mjs')), { handled: true }, 'short boxes still claim the click');
-  assert.equal(invalidated, 1, 'a click that changes nothing does not redraw');
+  assert.deepEqual(click(row('read src/config.mjs')), { handled: true }, 'one click opens the tool call and result');
+  assert.equal(invalidated, 2);
+  assert(shows('read output') && shows('"path": "src/config.mjs"'));
+  lines = component.render(60);
   assert.deepEqual(click(row('read src/config.mjs') - 1), { handled: true }, 'the blank line above a box is claimed too');
+  assert.equal(invalidated, 2, 'a separator click does not toggle');
   assert.equal(click(0), undefined, "the header click is Pi's");
 
   // Later updates from the worker, and the final result, keep the open steps.

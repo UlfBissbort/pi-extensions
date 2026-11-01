@@ -3,7 +3,7 @@
 // click on it belongs to. The Pi edge at the bottom turns renderResult arguments
 // and clicks into display events, runs the reducer, and executes its commands.
 import { stripVTControlCharacters } from 'node:util';
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from '@earendil-works/pi-tui';
+import { mixColors, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from '@earendil-works/pi-tui';
 import type { Theme, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { Step, StepId } from './run.ts';
 import {
@@ -12,7 +12,7 @@ import {
 } from './display.ts';
 import { keepScrollPosition } from './scroll.ts';
 
-export type Style = Pick<Theme, 'fg' | 'bg' | 'bold'>;
+export type Style = Pick<Theme, 'fg' | 'bg' | 'bold' | 'style' | 'colors'>;
 type Fg = Parameters<Theme['fg']>[0];
 type Bg = Parameters<Theme['bg']>[0];
 
@@ -42,7 +42,8 @@ export function describeTool(name: string, args: Record<string, unknown> = {}): 
 
 // How one step looks: a coloured box with a label, a title, a status marker, and a body.
 type Status = 'info' | 'pending' | 'ok' | 'error';
-type Box = { id: StepId; label: string; color: Fg; title: string; status: Status; body: string; durationMs?: number };
+type Box = { id: StepId; label: string; color: Fg; title: string; status: Status; body: string; durationMs?: number;
+  tool?: { argumentsText: string; resultText?: string } };
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const outcomeStatus = (outcome: 'pending' | 'ok' | 'error'): Status => outcome;
@@ -52,7 +53,9 @@ function stepBox(step: Step): Box {
     case 'request': return { id: step.id, label: 'request', color: 'muted', title: '', status: 'info', body: step.question };
     case 'model': return { id: step.id, label: 'model', color: 'accent', title: '', status: step.live ? 'pending' : 'info', body: step.text };
     case 'tool': return {
-      id: step.id, label: 'tool', color: 'toolTitle', title: describeTool(step.name, step.args), status: outcomeStatus(step.outcome), body: step.error ?? '',
+      id: step.id, label: 'tool', color: 'toolTitle', title: describeTool(step.name, step.args), status: outcomeStatus(step.outcome), body: '',
+      // Old session snapshots predate argumentsText/resultText; keep them replayable.
+      tool: { argumentsText: step.argumentsText ?? JSON.stringify(step.args ?? {}, null, 2), resultText: step.resultText ?? (step as Step & { error?: string }).error },
       ...(step.durationMs === undefined ? {} : { durationMs: step.durationMs }),
     };
     case 'submit': return {
@@ -87,15 +90,33 @@ export type Rendered = { lines: string[]; targets: (Target | undefined)[] };
 // Closed: header and at most the last PREVIEW_LINES body lines. Open: the whole body.
 function boxLines(box: Box, open: boolean, style: Style, width: number): Rendered {
   const fill = (line: string) => style.bg(background(box), truncateToWidth(` ${line} `, width, '…', true));
-  const text = safeDisplay(box.body).trim();
-  const body = text ? text.split('\n').flatMap(line => wrapTextWithAnsi(line, Math.max(1, width - LABEL_WIDTH - 2))) : [];
-  const toggles = body.length > PREVIEW_LINES;
+  const wrapBody = (text: string) => safeDisplay(text).split('\n').flatMap(line => wrapTextWithAnsi(line, Math.max(1, width - LABEL_WIDTH - 2)));
+  const body = box.body.trim() ? wrapBody(box.body.trim()) : [];
+  // Tool rows are always expandable, even while pending or with a short result.
+  const toggles = !!box.tool || body.length > PREVIEW_LINES;
   const status = [marker(box), toggles ? (open ? '▾' : '▸') : ''].filter(Boolean).join(' ');
   const head = `${style.fg(box.color, style.bold(box.label.padEnd(LABEL_WIDTH)))}${safeDisplay(box.title)}`;
   const lines = [fill(status ? `${truncateToWidth(head, width - visibleWidth(status) - 3, '…', true)} ${style.fg(box.color, status)}` : head)];
-  const hidden = body.length - PREVIEW_LINES;
-  const shown = toggles && !open ? [style.fg('dim', `… ${plural(hidden, 'more line')}`), ...body.slice(-PREVIEW_LINES)] : body;
-  lines.push(...shown.map(line => fill(`${' '.repeat(LABEL_WIDTH)}${line}`)));
+  if (box.tool && open) {
+    lines.push(fill('  arguments'));
+    lines.push(...wrapBody(box.tool.argumentsText).map(line => fill(`${' '.repeat(LABEL_WIDTH)}${line}`)));
+    // Derive a nearby green from the active theme, rather than hard-coding ANSI
+    // or assuming that another semantic background token is green.
+    const resultBg = box.status === 'ok'
+      ? mixColors(style.colors.toolSuccessBg, style.colors.customMessageBg, 0.35)
+      : undefined;
+    const fillResult = (line: string) => {
+      const text = truncateToWidth(` ${line} `, width, '…', true);
+      return resultBg ? style.style(text, { bg: resultBg }) : style.bg(background(box), text);
+    };
+    lines.push(fillResult('  result'));
+    const result = box.tool.resultText ?? 'waiting for result…';
+    lines.push(...wrapBody(result).map(line => fillResult(`${' '.repeat(LABEL_WIDTH)}${line}`)));
+  } else {
+    const hidden = body.length - PREVIEW_LINES;
+    const shown = toggles && !open ? [style.fg('dim', `… ${plural(hidden, 'more line')}`), ...body.slice(-PREVIEW_LINES)] : body;
+    lines.push(...shown.map(line => fill(`${' '.repeat(LABEL_WIDTH)}${line}`)));
+  }
   // The blank line above each box belongs to it, so a click there never reaches Pi's own toggle.
   return { lines: ['', ...lines], targets: [{ id: box.id, toggles: false }, ...lines.map(() => ({ id: box.id, toggles }))] };
 }
