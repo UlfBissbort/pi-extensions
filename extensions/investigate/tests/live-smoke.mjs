@@ -11,6 +11,8 @@ const requireHost = createRequire(`${host}/package.json`);
 const { createJiti } = requireHost('jiti');
 const jiti = createJiti(import.meta.url, { alias: { '@earendil-works/pi-coding-agent': `${host}/dist/index.js`, typebox: requireHost.resolve('typebox'), '@earendil-works/pi-ai': `${host}/node_modules/@earendil-works/pi-ai/dist/compat.js` } });
 const { runInvestigation } = await jiti.import('../src/worker.ts');
+const { createRunStore } = await jiti.import('../src/store.ts');
+const { steps } = await jiti.import('../src/run.ts');
 const { ModelRuntime } = await import(`${host}/dist/index.js`);
 const snapshot = await loadConfig(new URL('../', import.meta.url).pathname);
 snapshot.config.tools.allowBash = false;
@@ -18,8 +20,10 @@ snapshot.config.limits.maxTurns = 4;
 // Test only the protocol; do not expose the repository map or perform real research.
 snapshot.repositoryMap = 'This is a synthetic smoke test. Only inspect the supplied fixture.';
 const dir = await mkdtemp(join(tmpdir(), 'investigate-live-'));
-const uiMsgs = [];
-let agent;
+const events = [];
+const store = createRunStore('live');
+const dispatch = store.dispatch;
+store.dispatch = event => { events.push(event.type); return dispatch(event); };
 const controller = new AbortController();
 const timer = setTimeout(() => controller.abort(new Error('Smoke test timed out')), 60000);
 try {
@@ -28,17 +32,16 @@ try {
   const runtime = await ModelRuntime.create({ signal: controller.signal });
   console.log(`Testing ${snapshot.config.provider}/${snapshot.config.model} (${snapshot.config.thinkingLevel})`);
   const result = await runInvestigation({ snapshot, cwd: dir, signal: controller.signal, modelRuntime: runtime,
-    onUi: msg => uiMsgs.push(msg), onAgent: a => { agent = a; },
+    store,
     request: { question: `Read ${path}, then call submit_answer alone with text exactly "Smoke test passed." and one excerpt for that file, start_line 2, end_line 2. No other research is necessary.`, detail: 'brief', include_references: false },
   });
   assert(result.text.includes('Smoke test passed.'));
   assert(result.text.includes('  "live excerpt" & <source>\n'));
   assert.equal(result.excerpts.length, 1);
-  const { agentBlocks } = await jiti.import('../src/view.ts');
-  const blocks = agentBlocks(agent);
-  assert(blocks.some(b => b.kind === 'tool' && b.status === 'ok' && b.title.startsWith('read ')));
-  assert(blocks.some(b => b.kind === 'submit' && b.status === 'ok' && b.text.includes('Smoke test passed.')));
-  assert(uiMsgs.some(m => m.type === 'streaming'), 'streamed partial responses reach the UI');
-  console.log(JSON.stringify({ success: true, model: result.model, turns: result.turns, usage: result.usage, uiMsgs: uiMsgs.length }));
+  const chain = steps(result.agent);
+  assert(chain.some(s => s.kind === 'tool' && s.outcome === 'ok' && s.name === 'read'));
+  assert(chain.some(s => s.kind === 'submit' && s.outcome === 'ok' && s.answer.includes('Smoke test passed.')));
+  assert(events.includes('streamed'), 'streamed partial responses reach the store');
+  console.log(JSON.stringify({ success: true, model: result.model, turns: result.turns, usage: result.usage, events: events.length }));
   console.log(result.text);
 } finally { clearTimeout(timer); await rm(dir, { recursive: true, force: true }); }

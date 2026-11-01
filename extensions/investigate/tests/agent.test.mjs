@@ -20,6 +20,7 @@ const jiti = createJiti(import.meta.url, {
   },
 });
 const { runInvestigation } = await jiti.import('../src/worker.ts');
+const { createRunStore } = await jiti.import('../src/store.ts');
 const agentCore = await jiti.import('../src/agent.ts');
 const { render, status, nextStep, turnsInRun, usage, currentRun, append, CORRECTIVE_INSTRUCTION, MIXED_BATCH_REASON } = agentCore;
 const { ModelRuntime } = await import(`${host}/dist/index.js`);
@@ -120,8 +121,13 @@ test('a finished agent keeps its full record and is answered', async () => {
   const dir = await fixtureDir();
   try {
     const { runtime } = await scripted(scenarios.tools_then_submit);
+    // Watch the store: the agent value after every event.
+    const store = createRunStore('r');
     const seen = [];
-    const result = await run(runtime, dir, { onAgent: agent => seen.push(agent) });
+    const dispatch = store.dispatch;
+    store.dispatch = event => { const commands = dispatch(event); if (store.state().agent) seen.push(store.state().agent); return commands; };
+    const result = await run(runtime, dir, { store });
+    assert(seen.length > 5);
     const agent = result.agent;
     assert.equal(agent.__type, 'ET.InvestigationAgent');
     assert.match(agent.__uid, /^🍃-[0-9a-f]{20}$/);

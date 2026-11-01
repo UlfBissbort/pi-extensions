@@ -3,7 +3,8 @@ import { ModelRuntime, type ExtensionAPI } from '@earendil-works/pi-coding-agent
 import { loadConfig, loadWorkerContext } from './config.mjs';
 import { createSemaphore, limitsForEffort, normalizeRequest, zeroUsage } from './core.mjs';
 import { requestSchema, runInvestigation } from './worker.ts';
-import { init, update, view, type AgentView, type UiMsg } from './view.ts';
+import { snapshot as runSnapshot } from './run.ts';
+import { createRunStore } from './store.ts';
 import { renderInvestigationCall, renderInvestigationResult } from './render.ts';
 import { status, type InvestigationAgent, type Uid } from './agent.ts';
 import { setTui } from './scroll.ts';
@@ -12,30 +13,6 @@ import { setTui } from './scroll.ts';
 // agents are dropped first once the cap is reached.
 const MAX_AGENTS = 100;
 const agentHandle = (agent: InvestigationAgent) => `ET.InvestigationAgent('${agent.__uid}')`;
-
-// The Elm-style runtime at the edge: holds the UI model, applies update(), and
-// publishes view(). Streaming text is coalesced to at most one publish per 100 ms.
-function createUiStore(requestId: string, publish: (view: AgentView) => void) {
-  let model = init(requestId);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let closed = false;
-  const flush = () => {
-    if (timer) clearTimeout(timer);
-    timer = undefined;
-    if (closed) return;
-    try { publish(view(model)); } catch { /* UI failure must not abort a paid investigation. */ }
-  };
-  return {
-    dispatch(msg: UiMsg) {
-      if (closed) return;
-      model = update(model, msg);
-      if (msg.type !== 'streaming') flush();
-      else if (!timer) timer = setTimeout(flush, 100);
-    },
-    view: () => view(model),
-    close() { if (timer) clearTimeout(timer); timer = undefined; closed = true; },
-  };
-}
 
 export async function registerInvestigation(pi: ExtensionAPI, root: string, dependencies = {
   createRuntime: (signal: AbortSignal) => ModelRuntime.create({ signal }),
@@ -92,11 +69,10 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
       active.add(call);
       const started = Date.now();
       const requestId = randomUUID();
-      const ui = createUiStore(requestId, state => {
-        // Partial updates are UI events, not parent-model transcript messages.
-        onUpdate?.({ content: [], details: { requestId, view: state } });
-      });
-      ui.dispatch({ type: 'phase', phase: 'queued', note: 'Waiting for an investigation slot.' });
+      // One store per investigation. Partial updates are UI data for Pi's tool
+      // display, never parent-model transcript messages.
+      const store = createRunStore(requestId, snapshot => onUpdate?.({ content: [], details: { requestId, snapshot } }));
+      store.dispatch({ type: 'phase', phase: 'queued', note: 'Waiting for an investigation slot.' });
       let timer: ReturnType<typeof setTimeout> | undefined;
       let release = () => {};
       try {
@@ -108,29 +84,31 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
         timer = setTimeout(() => controller.abort(new Error('Investigation deadline exceeded')), remaining);
         slots.setLimit(snapshot.config.limits.maxConcurrentInvestigations);
         release = await slots.acquire(controller.signal);
-        ui.dispatch({ type: 'phase', phase: 'starting', model: `${snapshot.config.provider}/${snapshot.config.model}` });
+        store.dispatch({ type: 'phase', phase: 'starting', model: `${snapshot.config.provider}/${snapshot.config.model}` });
         const modelRuntime = await dependencies.createRuntime(controller.signal);
         // Re-read after admission: queued workers receive the current starting
         // instructions and repo skill, not the versions present before waiting.
         const freshSnapshot = { ...snapshot, ...await loadWorkerContext(root, snapshot.config) };
         controller.signal.throwIfAborted();
-        const result = await runInvestigation({ snapshot: freshSnapshot, request, cwd: ctx.cwd, signal: controller.signal, modelRuntime, onUi: ui.dispatch, onAgent: agent => { keepAgent(agent); ui.dispatch({ type: 'agent', agent }); } });
-        ui.dispatch({ type: 'phase', phase: 'completed' });
+        const result = await runInvestigation({ snapshot: freshSnapshot, request, cwd: ctx.cwd, signal: controller.signal, modelRuntime, store });
+        keepAgent(result.agent);
+        store.dispatch({ type: 'phase', phase: 'completed' });
         return {
           content: [{ type: 'text' as const, text: result.text }],
-          details: { requestId, view: ui.view(), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0, agent: agentHandle(result.agent), agentStatus: status(result.agent) },
+          details: { requestId, snapshot: runSnapshot(store.state()), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0, agent: agentHandle(result.agent), agentStatus: status(result.agent) },
           usage: result.usage,
         };
       } catch (error) {
         const e = error as Error & { usage?: ReturnType<typeof zeroUsage>; turns?: number; agent?: InvestigationAgent };
-        ui.dispatch({ type: 'phase', phase: controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
+        if (e.agent) keepAgent(e.agent);
+        store.dispatch({ type: 'phase', phase: controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
         return {
           content: [{ type: 'text' as const, text: `Investigation failed or incomplete: ${e.message}` }],
-          details: { requestId, view: ui.view(), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(e.agent ? { agent: agentHandle(e.agent), agentStatus: status(e.agent) } : {}) },
+          details: { requestId, snapshot: runSnapshot(store.state()), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(e.agent ? { agent: agentHandle(e.agent), agentStatus: status(e.agent) } : {}) },
           usage: e.usage ?? zeroUsage(), isError: true,
         };
       } finally {
-        ui.close();
+        store.close();
         if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', cancel);
         release(); active.delete(call); finish();
