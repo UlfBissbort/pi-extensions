@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { jiti } from './jiti.mjs';
 
-const { NAMES, pickName, resolveName, parseAddress, firstPart } = await jiti.import('../src/names.ts');
+const { NAMES, pickName, resolveName, parseAddress, firstPart, addressToken, completeAddress, applyAddress } = await jiti.import('../src/names.ts');
 
 test('the name list is unique, identifier-shaped, and prefix-free', () => {
   assert(NAMES.length >= 200);
@@ -39,4 +39,18 @@ test('an address resolves by exact name or unique prefix', () => {
   assert.deepEqual(parseAddress('@kant: check the tests\nand the docs'), { token: 'kant', message: 'check the tests\nand the docs' });
   assert.equal(parseAddress('email me @ home'), undefined);
   assert.equal(parseAddress('@kant'), undefined, 'an address without a message is ordinary input');
+});
+
+test('an address is completed only at the start of the message, matching any part of a name', () => {
+  assert.equal(addressToken(['@kan'], 0, 4), 'kan');
+  assert.equal(addressToken(['@'], 0, 1), '');
+  assert.equal(addressToken(['hi @kan'], 0, 7), undefined);
+  assert.equal(addressToken(['@kant x'], 0, 7), undefined, 'the address already ends');
+  assert.equal(addressToken(['x', '@kan'], 1, 4), undefined);
+  const c = [{ name: 'richard_the_lionheart', description: '' }, { name: 'kant_the_punctual', description: '' }];
+  assert.deepEqual(completeAddress('lion', c).map(x => x.name), ['richard_the_lionheart']);
+  assert.deepEqual(completeAddress('the', c).map(x => x.name), ['richard_the_lionheart', 'kant_the_punctual']);
+  assert.deepEqual(completeAddress('', c).length, 2);
+  assert.deepEqual(applyAddress(['@ri do this', 'next'], 3, 'richard_the_lionheart'),
+    { lines: ['@richard_the_lionheart do this', 'next'], cursorLine: 0, cursorCol: 23 });
 });

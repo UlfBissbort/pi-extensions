@@ -59,7 +59,13 @@ richard_the_lionheart = ET.InvestigationAgent('🍃-7a1c04e2b9d3f5a81c60') answe
 
 A result without this line means no investigator was involved, for example an unknown handle, a configuration problem, or a cancellation while queued.
 
-The user can write to a running investigator directly, by typing `@name message`. Such messages take precedence over your request. When the investigator read any, the result lists them after the first line, and its answer takes them into account; treat them as the user's current wishes and do not repeat the original request against them. Messages that arrived after it finished are listed as unread; continue the investigator if they still need an answer.
+The user can write to an investigator directly, by typing `@name message`. Such messages take precedence over your request.
+
+- While it runs, the message reaches it before its next model request. The result lists the messages after the first line, and its answer takes them into account; treat them as the user's current wishes and do not repeat the original request against them.
+- When the message arrives while it is finishing, the result lists it, and the investigator continues with it in a new run afterwards.
+- When the investigator has finished, the message resumes it with its full context.
+
+A run the user started reaches you as a separate message rather than a tool result. It starts with the same line, says that the user resumed the investigator directly and with which messages, and then gives the answer. Treat it like a result you asked for: use the answer and respond to the user. Do not continue that investigator while such a run is in progress; the call is refused with status `running`.
 
 ### Effort guide
 

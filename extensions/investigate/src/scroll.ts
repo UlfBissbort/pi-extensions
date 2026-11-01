@@ -15,10 +15,11 @@ export const holdScroll = (state: ScrollState): ScrollCommand =>
 // scroll view's scrollTo is not part of Pi's public TUI API; without it, clicks
 // still work and the transcript behaves as before.
 type ScrollView = { scrollTop: number; isFollowingEnd: boolean; scrollTo(top: number, options: { disableFollow: boolean }): void };
-type Tui = { getPrimaryScrollView?: () => ScrollView | undefined };
+type Tui = { getPrimaryScrollView?: () => ScrollView | undefined; requestRender?: () => void };
 let tui: Tui | undefined;
 
 export const setTui = (value: unknown) => { tui = value as Tui; };
+export const requestRender = () => { try { tui?.requestRender?.(); } catch { /* cosmetic */ } };
 
 export function keepScrollPosition() {
   try {

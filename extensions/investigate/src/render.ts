@@ -5,12 +5,12 @@
 import { stripVTControlCharacters } from 'node:util';
 import { mixColors, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from '@earendil-works/pi-tui';
 import type { Theme, ToolDefinition } from '@earendil-works/pi-coding-agent';
-import type { Step, StepId } from './run.ts';
+import type { Snapshot, Step, StepId } from './run.ts';
 import {
   eventsFromRender, initDisplay, isOpen, reduceAll, reduceDisplay, RESULT_ID,
   type DisplayCommand, type DisplayEvent, type DisplayState,
 } from './display.ts';
-import { keepScrollPosition } from './scroll.ts';
+import { keepScrollPosition, requestRender } from './scroll.ts';
 
 export type Style = Pick<Theme, 'fg' | 'bg' | 'bold' | 'style' | 'colors'>;
 type Fg = Parameters<Theme['fg']>[0];
@@ -259,3 +259,51 @@ export const renderInvestigationResult: NonNullable<ToolDefinition['renderResult
   execute(commands.filter(c => c.type !== 'redraw'), edge);
   return component;
 };
+
+// --- Runs outside a tool call ------------------------------------------------
+// A run the user started by writing to a finished investigator has no tool
+// display. While it works, its chain is a widget above the editor; when it ends,
+// one custom message carries the finished chain into the transcript.
+
+const MAX_LIVE_LINES = 24;
+
+// The live widget: the same chain, cut to its most recent lines so the editor stays usable.
+export function liveChain(style: Style, redraw: () => void) {
+  const holder: Holder = {};
+  const chain = new StepChain();
+  chain.edge = { holder, style, pad: 1, invalidate: redraw };
+  const component: Component = {
+    render(width: number) {
+      const lines = chain.render(width);
+      if (lines.length <= MAX_LIVE_LINES) return lines;
+      const hidden = lines.length - MAX_LIVE_LINES + 2;
+      const note = truncateToWidth(style.fg('dim', `   … ${hidden} earlier lines; the whole chain appears in the transcript when it finishes`), Math.max(1, width), '…');
+      return [lines[0], note, ...lines.slice(-(MAX_LIVE_LINES - 2))];
+    },
+    invalidate() { chain.invalidate(); },
+  };
+  const update = (snapshot: Snapshot) => {
+    const state = holder.display ?? initDisplay(false);
+    const [next] = reduceAll(state, eventsFromRender(state, { snapshot, text: '', isPartial: true, isError: false, expanded: state.defaultOpen }));
+    holder.display = next;
+    redraw();
+  };
+  return { component, update };
+}
+
+// The finished box in the transcript, rebuilt by Pi from the message whenever it needs to.
+export type ReportDetails = { snapshot?: Snapshot; failed?: boolean };
+export function renderReport(message: { content: unknown; details?: unknown }, options: { expanded: boolean; outputPad?: number }, style: Style): Component {
+  const details = message.details as ReportDetails | undefined;
+  const content = message.content;
+  const text = typeof content === 'string' ? content
+    : Array.isArray(content) ? content.filter(c => c?.type === 'text').map(c => c.text).join('\n') : '';
+  const initial = initDisplay(options.expanded);
+  const [display] = reduceAll(initial, eventsFromRender(initial, {
+    ...(details?.snapshot ? { snapshot: details.snapshot } : {}), text, isPartial: false, isError: !!details?.failed, expanded: options.expanded,
+  }));
+  const holder: Holder = { display };
+  const chain = new StepChain();
+  chain.edge = { holder, style, pad: options.outputPad ?? 1, invalidate: requestRender };
+  return chain;
+}

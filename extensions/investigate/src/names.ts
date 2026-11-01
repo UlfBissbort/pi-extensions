@@ -38,3 +38,22 @@ export function parseAddress(text: string): { token: string; message: string } |
   const match = text.match(/^@([a-z0-9_]+(?:\.\.\.|…)?)[\s,:]+(\S[\s\S]*)$/);
   return match ? { token: match[1], message: match[2].trim() } : undefined;
 }
+
+// Autocomplete for an address: only an `@token` at the very start of the message
+// counts, since only there is it an address. A token matches a name when the name
+// or one of its parts starts with it, so `@lion` finds richard_the_lionheart.
+export const addressToken = (lines: string[], cursorLine: number, cursorCol: number): string | undefined =>
+  cursorLine === 0 ? (lines[0] ?? '').slice(0, cursorCol).match(/^@([a-z0-9_]*)$/)?.[1] : undefined;
+
+export type Candidate = { name: string; description: string };
+export function completeAddress(token: string, candidates: Candidate[]): Candidate[] {
+  const matches = (name: string) => name.startsWith(token) || name.split('_').some(part => part.startsWith(token));
+  return candidates.filter(c => matches(c.name));
+}
+
+// The text after choosing a name: `@name ` replaces the token; the rest of the line is kept.
+export function applyAddress(lines: string[], cursorCol: number, name: string) {
+  const first = lines[0] ?? '';
+  const inserted = `@${name} `;
+  return { lines: [inserted + first.slice(cursorCol).replace(/^ /, ''), ...lines.slice(1)], cursorLine: 0, cursorCol: inserted.length };
+}

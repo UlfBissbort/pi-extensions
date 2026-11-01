@@ -18,10 +18,12 @@ export type InvestigationConfig = {
   workerPrompt: string; repositoryMapSource: string; repositoryMap: string;
   cwd: string; tools: ToolDeclaration[]; timestamp: number;
   name?: string;                       // drawn by the host at launch; absent in older records
+  railIndex?: number;                  // the agent's colour lane, kept across its runs
 };
 export type InvestigationRequest = {
   __type: 'ET.InvestigationRequest'; __uid: Uid;
   request: Record<string, unknown>; limits: Limits; timestamp: number;
+  from?: 'user';                       // the human user resumed the agent directly; otherwise the parent asked
 };
 export type HostInstruction = { __type: 'ET.HostInstruction'; __uid: Uid; content: string; timestamp: number };
 // A message the human user sent to this investigator while it was running.
@@ -61,6 +63,11 @@ export function runLimits(agent: InvestigationAgent): Limits {
   return start.limits;
 }
 export const agentName = (agent: InvestigationAgent): string | undefined => config(agent).name;
+export const railOf = (agent: InvestigationAgent): number | undefined => config(agent).railIndex;
+export function lastRequest(agent: InvestigationAgent): InvestigationRequest | undefined {
+  const found = agent.context_[lastIndexOf(agent.context_, 'ET.InvestigationRequest')];
+  return found?.__type === 'ET.InvestigationRequest' ? found : undefined;
+}
 export const userMessages = (entries: Entry[]) => entries.filter((e): e is UserMessage => e.__type === 'ET.UserMessage');
 export const responses = (entries: Entry[]) => entries.filter((e): e is LLMResponse => e.__type === 'ET.LLMResponse');
 export const turnsInRun = (agent: InvestigationAgent) => responses(currentRun(agent)).length;
@@ -132,7 +139,8 @@ export function render(agent: InvestigationAgent): Context {
       case 'ET.InvestigationRequest': {
         if (!latestConfig) throw new Error('Request precedes configuration');
         if (messages.length) {
-          messages.push({ role: 'user', content: [{ type: 'text', text: continuationText(e.request, e.limits) }], timestamp: e.timestamp });
+          const text = e.from === 'user' ? resumedByUserText(String(e.request.question ?? ''), e.limits) : continuationText(e.request, e.limits);
+          messages.push({ role: 'user', content: [{ type: 'text', text }], timestamp: e.timestamp });
           break;
         }
         messages.push({
@@ -158,5 +166,7 @@ export function render(agent: InvestigationAgent): Context {
 export const requestText = (request: Record<string, unknown>) => `Investigation request (task data):\n${JSON.stringify(request, null, 2)}`;
 export const userMessageText = (content: string) =>
   `Message from the human user, sent to you while you were working. It takes precedence over the original request where they conflict; continue accordingly and finish with submit_answer.\n\n${content}`;
+export const resumedByUserText = (content: string, limits: Limits) =>
+  `The human user resumes this investigation directly with a message. Everything above is your own previous work; build on it and answer the message with submit_answer. The caller receives your answer together with the message. These limits replace the earlier ones.\n\n# Hard limits for this run\n${limitsText(limits)}\n\nMessage from the human user:\n${content}`;
 export const continuationText = (request: Record<string, unknown>, limits: Limits) =>
   `The caller continues this investigation. Everything above is your own previous work; build on it rather than repeating it, and answer this follow-up with submit_answer. These limits replace the earlier ones.\n\n# Hard limits for this run\n${limitsText(limits)}\n\nFollow-up request (task data):\n${JSON.stringify(request, null, 2)}`;

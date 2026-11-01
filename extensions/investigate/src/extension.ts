@@ -1,35 +1,48 @@
 import { randomUUID } from 'node:crypto';
-import { ModelRuntime, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, type ExtensionAPI, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import { loadConfig, loadWorkerContext } from './config.mjs';
 import { createSemaphore, limitsForEffort, normalizeRequest, zeroUsage } from './core.mjs';
 import { requestSchema, runInvestigation } from './worker.ts';
 import { snapshot as runSnapshot } from './run.ts';
-import { createRunStore } from './store.ts';
-import { renderInvestigationCall, renderInvestigationResult } from './render.ts';
-import { agentName, currentRun, status, userMessages, type InvestigationAgent, type Uid } from './agent.ts';
-import { firstPart, NAMES, parseAddress, pickName, resolveName } from './names.ts';
-import type { RunStore } from './store.ts';
+import { createRunStore, type RunStore } from './store.ts';
+import { liveChain, renderInvestigationCall, renderInvestigationResult, renderReport, type ReportDetails } from './render.ts';
+import {
+  agentName, config as agentConfig, currentRun, lastRequest, railOf, status, userMessages,
+  type InvestigationAgent, type Uid,
+} from './agent.ts';
+import { addressToken, applyAddress, completeAddress, firstPart, NAMES, parseAddress, pickName, resolveName, type Candidate } from './names.ts';
 import { setTui } from './scroll.ts';
 
 // Agents stay in memory after their run so a later step can resume them. Oldest
 // agents are dropped first once the cap is reached.
 const MAX_AGENTS = 100;
+// Custom message type of the result of a run the user started, sent to the parent.
+export const REPORT = 'investigation-report';
 const agentHandle = (agent: InvestigationAgent) => `ET.InvestigationAgent('${agent.__uid}')`;
 // A handle: the full ET.InvestigationAgent('🍃-…') form or the bare UID.
 const handleUid = (handle: string): Uid | undefined =>
   handle.trim().match(/^(?:ET\.InvestigationAgent\(['"])?(🍃-[0-9a-f]{20})(?:['"]\))?$/)?.[1] as Uid | undefined;
+
 // The parent model sees this header first in every result that has an agent:
-// `name = handle status`, then any messages the user sent it during this call.
+// `name = handle status`, then what the user sent it during this run.
 const quote = (messages: string[]) => messages.map(m => `- ${JSON.stringify(m)}`).join('\n');
 function withHeader(agent: InvestigationAgent | undefined, text: string, late: string[] = []) {
   if (!agent) return text;
   const name = agentName(agent);
   const lines = [`${name ? `${name} = ` : ''}${agentHandle(agent)} ${status(agent)}`];
-  const read = userMessages(currentRun(agent)).map(m => m.content);
-  if (read.length) lines.push(`The user sent this investigator messages during this call; its answer takes them into account:\n${quote(read)}`);
-  if (late.length) lines.push(`The user sent these messages after it had finished; it has not read them:\n${quote(late)}`);
+  const run = currentRun(agent);
+  const start = run[0];
+  const read = userMessages(run).map(m => m.content);
+  if (start?.__type === 'ET.InvestigationRequest' && start.from === 'user') {
+    lines.push(`The user resumed this investigator directly, not through your call, with these messages; its answer responds to them:\n${quote([String(start.request.question ?? ''), ...read])}`);
+  } else if (read.length) {
+    lines.push(`The user sent this investigator messages during this call; its answer takes them into account:\n${quote(read)}`);
+  }
+  if (late.length) lines.push(`The user sent these messages while it was finishing; it continues with them now and reports back in a separate message:\n${quote(late)}`);
   return `${lines.join('\n\n')}\n\n${text}`;
 }
+
+type Failure = Error & { usage?: ReturnType<typeof zeroUsage>; turns?: number; agent?: InvestigationAgent };
 
 export async function registerInvestigation(pi: ExtensionAPI, root: string, dependencies = {
   createRuntime: (signal: AbortSignal) => ModelRuntime.create({ signal }),
@@ -47,7 +60,7 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
   const busy = new Set<Uid>();
   // Names are never issued twice in a session, including after a reload (see session_start).
   const issued = new Set<string>();
-  // Investigators that can receive user messages now, by name: from launch until their call ends.
+  // Investigators that can receive user messages now, by name: from launch until their run ends.
   const running = new Map<string, RunStore>();
   const issueName = () => {
     const name = pickName(NAMES, issued, new Set([...running.keys()].map(firstPart)));
@@ -61,9 +74,162 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     for (const agent of agents.values()) if (agentName(agent) === address.trim()) return agent.__uid;
     return undefined;
   };
+  const byName = (name: string) => [...agents.values()].find(agent => agentName(agent) === name);
   let closed = false;
-  // Adjacent calls get different rail colours, including calls running in parallel.
+  // Adjacent agents get different rail colours, including agents running in parallel.
+  // An agent keeps its colour across all its runs.
   let nextRailIndex = 0;
+  let ui: ExtensionUIContext | undefined;
+  const notify = (text: string, level: 'info' | 'warning') => { try { ui?.notify(text, level); } catch { /* UI is optional */ } };
+
+  // Track a run for shutdown: every run, from tool calls or the user, is aborted and awaited.
+  const track = (signal?: AbortSignal) => {
+    const controller = new AbortController();
+    const cancel = () => controller.abort(signal?.reason ?? new Error('Investigation cancelled'));
+    signal?.addEventListener('abort', cancel, { once: true });
+    if (signal?.aborted) cancel();
+    let finish!: () => void;
+    const call = { controller, done: new Promise<void>(resolve => { finish = resolve; }) };
+    active.add(call);
+    return { controller, end: () => { signal?.removeEventListener('abort', cancel); active.delete(call); finish(); } };
+  };
+
+  // One run of an investigator, shared by parent tool calls and user-started runs:
+  // budget, deadline, a concurrency slot, the model runtime, then the worker.
+  async function investigate({ args, previous, name, railIndex, store, signal, started, cwd, from }: {
+    args: Record<string, unknown>; previous?: InvestigationAgent; name?: string; railIndex: number;
+    store: RunStore; signal: AbortSignal; started: number; cwd: string; from?: 'user';
+  }, abort: (reason: Error) => void) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let release = () => {};
+    try {
+      const snapshot = await loadConfig(root);
+      signal.throwIfAborted();
+      const request = normalizeRequest(args, snapshot.config);
+      const remaining = limitsForEffort(snapshot.config, request.effort).timeoutSeconds * 1000 - (Date.now() - started);
+      if (remaining <= 0) throw new Error('Investigation deadline exceeded');
+      timer = setTimeout(() => abort(new Error('Investigation deadline exceeded')), remaining);
+      slots.setLimit(snapshot.config.limits.maxConcurrentInvestigations);
+      release = await slots.acquire(signal);
+      store.dispatch({ type: 'phase', phase: 'starting', model: `${snapshot.config.provider}/${snapshot.config.model}` });
+      const modelRuntime = await dependencies.createRuntime(signal);
+      // Re-read after admission: queued workers receive the current starting
+      // instructions and repo skill, not the versions present before waiting.
+      const freshSnapshot = { ...snapshot, ...await loadWorkerContext(root, snapshot.config) };
+      signal.throwIfAborted();
+      return await runInvestigation({ snapshot: freshSnapshot, request, cwd, signal, modelRuntime, store, agent: previous, name, railIndex, from });
+    } finally {
+      if (timer) clearTimeout(timer);
+      release();
+    }
+  }
+
+  // Stop accepting user messages for this run and take those it did not read.
+  // Synchronous, so no message can arrive in between.
+  const takeLate = (name: string | undefined, store: RunStore) => {
+    if (name && running.get(name) === store) running.delete(name);
+    return store.state().inbox ?? [];
+  };
+
+  // The user wrote to an idle investigator, or wrote while it was finishing. It
+  // resumes in the background with its full context. Its chain is a widget above
+  // the editor while it works; when it ends, one message carries the finished
+  // chain into the transcript and the result to the parent. Reservation happens
+  // synchronously, before any other caller can reach the agent.
+  function resumeForUser(agent: InvestigationAgent, messages: string[]) {
+    const uid = agent.__uid;
+    const name = agentName(agent);
+    const railIndex = railOf(agent) ?? nextRailIndex++;
+    const requestId = randomUUID();
+    const started = Date.now();
+    const run = track();
+    busy.add(uid);
+    const key = `investigate-run-${requestId}`;
+    let view: ReturnType<typeof liveChain> | undefined;
+    try {
+      ui?.setWidget(key, (tui, theme) => { view = liveChain(theme, () => tui.requestRender()); return view.component; }, { placement: 'aboveEditor' });
+    } catch { /* No terminal UI: the run still works and reports. */ }
+    const store = createRunStore(requestId, snapshot => view?.update(snapshot), railIndex, name);
+    store.dispatch({ type: 'phase', phase: 'queued', note: 'Waiting for an investigation slot.' });
+    if (name) running.set(name, store);
+    // Further messages wait in the inbox and enter before the first model request.
+    for (const content of messages.slice(1)) store.dispatch({ type: 'messaged', content });
+    // The previous run's preferences carry over; the user's message is the request.
+    const { question: _q, context: _c, scope: _s, ...preferences } = lastRequest(agent)?.request ?? {};
+    const args = { ...preferences, question: messages[0] };
+    void (async () => {
+      let text: string, failed: boolean, finalAgent: InvestigationAgent | undefined, late: string[] = [];
+      let usage = zeroUsage();
+      try {
+        const result = await investigate({ args, previous: agent, name, railIndex, store, signal: run.controller.signal, started, cwd: agentConfig(agent).cwd, from: 'user' },
+          reason => run.controller.abort(reason));
+        late = takeLate(name, store);
+        finalAgent = result.agent;
+        store.dispatch({ type: 'phase', phase: 'completed' });
+        text = withHeader(result.agent, result.text, late);
+        failed = false;
+        usage = result.usage;
+      } catch (error) {
+        const e = error as Failure;
+        late = takeLate(name, store);
+        finalAgent = e.agent ?? agent;
+        store.dispatch({ type: 'phase', phase: run.controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
+        text = withHeader(finalAgent, `Investigation failed or incomplete: ${e.message}`, late);
+        failed = true;
+        usage = e.usage ?? usage;
+      }
+      keepAgent(finalAgent);
+      busy.delete(uid);
+      store.close();
+      try { ui?.setWidget(key, undefined); } catch { /* UI is optional */ }
+      run.end();
+      if (closed) return;
+      const details: ReportDetails & Record<string, unknown> = {
+        requestId, snapshot: runSnapshot(store.state()), failed, elapsedMs: Date.now() - started, usage,
+        agent: agentHandle(finalAgent), agentStatus: status(finalAgent), ...(name ? { name } : {}),
+      };
+      // To the parent: starts a turn when it is idle, follows its current run when busy.
+      pi.sendMessage({ customType: REPORT, content: text, display: true, details }, { triggerTurn: true, deliverAs: 'followUp' });
+      if (late.length) resumeForUser(finalAgent, late);
+    })();
+    return name;
+  }
+
+  // Who `@` can address now: running investigators first, then retained finished ones,
+  // which resume when written to.
+  const candidates = (): Candidate[] => {
+    const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    const live = [...running].map(([name, store]) => {
+      const state = store.state();
+      return { name, description: `${state.phase === 'running' ? 'running' : state.phase} · ${plural(runSnapshot(state).turns, 'model request')} · reads your message at its next turn` };
+    });
+    const idle = [...agents.values()].reverse().flatMap(agent => {
+      const name = agentName(agent);
+      return name && !running.has(name) ? [{ name, description: `${status(agent)} · resumes with your message, then reports to the parent` }] : [];
+    });
+    return [...live, ...idle];
+  };
+  let completing = false;
+  const addCompletion = (target: ExtensionUIContext) => {
+    if (completing) return;
+    completing = true;
+    target.addAutocompleteProvider(current => ({
+      triggerCharacters: [...new Set([...(current.triggerCharacters ?? []), '@'])],
+      async getSuggestions(lines, cursorLine, cursorCol, options) {
+        const token = addressToken(lines, cursorLine, cursorCol);
+        const items = token === undefined ? [] : completeAddress(token, candidates());
+        if (!items.length) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+        return { prefix: `@${token}`, items: items.map(c => ({ value: c.name, label: `@${c.name}`, description: c.description })) };
+      },
+      applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+        const ours = addressToken(lines, cursorLine, cursorCol) !== undefined && item.label === `@${item.value}` && candidates().some(c => c.name === item.value);
+        return ours ? applyAddress(lines, cursorCol, item.value) : current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+      },
+      shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+        return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+      },
+    }));
+  };
 
   pi.on('before_agent_start', async event => {
     if (event.systemPromptOptions.selectedTools.includes('investigate')) {
@@ -71,33 +237,49 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
       event.systemPromptOptions.sections.investigation = snapshot.parentPrompt;
     } else delete event.systemPromptOptions.sections.investigation;
   });
-  // An empty widget below the editor is the public way to receive the TUI; it renders no lines.
   pi.on('session_start', async (_event, ctx) => {
     // Every name this session ever showed, on any branch, stays taken.
     for (const entry of ctx.sessionManager?.getEntries?.() ?? []) {
-      const message = (entry as { type?: string; message?: { role?: string; toolName?: string; details?: { name?: unknown } } }).message;
-      if (entry.type === 'message' && message?.role === 'toolResult' && message.toolName === 'investigate' && typeof message.details?.name === 'string') issued.add(message.details.name);
+      const message = (entry as { type?: string; message?: { role?: string; toolName?: string; customType?: string; details?: { name?: unknown } } }).message;
+      const name = message?.details?.name;
+      const ours = message?.role === 'toolResult' ? message.toolName === 'investigate' : message?.role === 'custom' && message.customType === REPORT;
+      if (entry.type === 'message' && ours && typeof name === 'string') issued.add(name);
     }
     if (!ctx.hasUI) return;
+    ui = ctx.ui;
+    try { addCompletion(ctx.ui); } catch { /* Not every UI supports autocomplete composition. */ }
+    // An empty widget below the editor is the public way to receive the TUI; it renders no lines.
     ctx.ui.setWidget('investigate-scroll', tui => { setTui(tui); return { render: () => [], invalidate() {} }; }, { placement: 'belowEditor' });
   });
-  // `@name message` from the user goes to that running investigator, not to the parent.
+  // `@name message` from the user goes to that investigator, not to the parent:
+  // into its inbox while it runs, or resuming it when it has finished.
   pi.on('input', async (event, ctx) => {
     if (event.source === 'extension') return { action: 'continue' };
+    if (ctx.hasUI) ui = ctx.ui;
     const address = parseAddress(event.text);
     if (!address) return { action: 'continue' };
     const target = resolveName(address.token, running.keys());
-    const say = (text: string, level: 'info' | 'warning') => { if (ctx.hasUI) ctx.ui.notify(text, level); };
-    if (target.kind === 'ambiguous') { say(`@${address.token} matches ${target.names.join(', ')}; write more of the name.`, 'warning'); return { action: 'handled' }; }
-    if (target.kind === 'none') {
-      // A known investigator that is not running cannot read it; anything else is ordinary text for the parent.
-      const idle = resolveName(address.token, issued);
-      if (idle.kind !== 'one') return { action: 'continue' };
-      say(`${idle.name} is not running, so it cannot read messages. Ask the parent to continue it.`, 'warning');
+    if (target.kind === 'ambiguous') { notify(`@${address.token} matches ${target.names.join(', ')}; write more of the name.`, 'warning'); return { action: 'handled' }; }
+    if (target.kind === 'one') {
+      running.get(target.name)!.dispatch({ type: 'messaged', content: address.message });
+      notify(`Sent to ${target.name}; it reads it before its next model request.`, 'info');
       return { action: 'handled' };
     }
-    running.get(target.name)!.dispatch({ type: 'messaged', content: address.message });
-    say(`Sent to ${target.name}; it reads it before its next model request.`, 'info');
+    // Not running: a known investigator resumes; anything else is ordinary text for the parent.
+    const known = resolveName(address.token, issued);
+    if (known.kind === 'ambiguous') { notify(`@${address.token} matches ${known.names.join(', ')}; write more of the name.`, 'warning'); return { action: 'handled' }; }
+    if (known.kind !== 'one') return { action: 'continue' };
+    const agent = byName(known.name);
+    if (!agent) {
+      notify(`${known.name} is no longer retained (evicted or lost on reload), so it cannot resume. Ask the parent for a new investigation.`, 'warning');
+      return { action: 'handled' };
+    }
+    if (busy.has(agent.__uid)) {
+      notify(`${known.name} is about to run for the parent; write to it again once it has started.`, 'warning');
+      return { action: 'handled' };
+    }
+    resumeForUser(agent, [address.message]);
+    notify(`Resuming ${known.name} with your message; it reports back to the parent when done.`, 'info');
     return { action: 'handled' };
   });
   pi.on('session_shutdown', async () => {
@@ -105,6 +287,7 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     for (const call of active) call.controller.abort(new Error('Investigation extension shut down'));
     await Promise.allSettled([...active].map(call => call.done));
   });
+  pi.registerMessageRenderer?.(REPORT, (message, options, theme) => renderReport(message, options as { expanded: boolean; outputPad?: number }, theme));
   pi.registerTool({
     name: 'investigate', label: 'Investigate',
     description: 'Default information-gathering tool: delegate lookups, code/library exploration, and note retrieval to an isolated smaller model. Supply a self-contained question; it cannot see this conversation. Returns final text and optional exact source excerpts, never the exploration trace, headed by the investigator name, handle, and status. Pass that name or handle as agent to continue the same investigator with its full previous context. Issue independent calls together for parallel investigation.',
@@ -120,14 +303,8 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     async execute(_id, args, signal, onUpdate, ctx) {
       if (closed) throw new Error('Investigation extension is shutting down');
-      const controller = new AbortController();
-      const cancel = () => controller.abort(signal?.reason ?? new Error('Investigation cancelled'));
-      signal?.addEventListener('abort', cancel, { once: true });
-      if (signal?.aborted) cancel();
-      let finish!: () => void;
-      const done = new Promise<void>(resolve => { finish = resolve; });
-      const call = { controller, done };
-      active.add(call);
+      if (ctx?.hasUI && ctx.ui) ui = ctx.ui;
+      const run = track(signal);
       const started = Date.now();
       const requestId = randomUUID();
       // Which investigator runs: a continued one (looked up and reserved now, so
@@ -142,19 +319,19 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
         if (!uid) lookupError = handleUid(address) || NAMES.includes(address.replace(/_\d+$/, '')) || issued.has(address)
           ? `Unknown agent ${address}: not retained here (never started in this session, evicted, or lost on reload). Start a new investigation and pass what it needs in context`
           : `Invalid agent: ${address} is neither an investigator name nor a handle`;
-        else if (busy.has(uid)) refusal = { uid, ...(agents.get(uid) && agentName(agents.get(uid)!) ? { name: agentName(agents.get(uid)!) } : {}) };
+        else if (busy.has(uid)) refusal = { uid, ...(agentName(agents.get(uid)!) ? { name: agentName(agents.get(uid)!) } : {}) };
         else { previous = agents.get(uid); busy.add(reserved = uid); }
       }
       const name = lookupError || refusal ? undefined : previous ? agentName(previous) : issueName();
+      const railIndex = (previous && railOf(previous)) ?? nextRailIndex++;
       // One store per investigation. Partial updates are UI data for Pi's tool
       // display, never parent-model transcript messages.
-      const store = createRunStore(requestId, snapshot => onUpdate?.({ content: [], details: { requestId, snapshot } }), nextRailIndex++, name);
+      const store = createRunStore(requestId, snapshot => onUpdate?.({ content: [], details: { requestId, snapshot } }), railIndex, name);
       store.dispatch({ type: 'phase', phase: 'queued', note: 'Waiting for an investigation slot.' });
       // From launch on, the user can write to it with @name, even while it is queued.
       if (name) running.set(name, store);
-      const stopListening = () => { if (name && running.get(name) === store) running.delete(name); };
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let release = () => {};
+      // Messages the user sent while it was finishing start a new run after this one.
+      let resume: { agent: InvestigationAgent; late: string[] } | undefined;
       try {
         if (refusal) {
           // Not a failure of the investigator: this call never started, and its record is untouched.
@@ -168,52 +345,41 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
           };
         }
         if (lookupError) throw new Error(lookupError);
-        const snapshot = await loadConfig(root);
-        controller.signal.throwIfAborted();
-        const request = normalizeRequest(rest, snapshot.config);
-        const remaining = limitsForEffort(snapshot.config, request.effort).timeoutSeconds * 1000 - (Date.now() - started);
-        if (remaining <= 0) throw new Error('Investigation deadline exceeded');
-        timer = setTimeout(() => controller.abort(new Error('Investigation deadline exceeded')), remaining);
-        slots.setLimit(snapshot.config.limits.maxConcurrentInvestigations);
-        release = await slots.acquire(controller.signal);
-        store.dispatch({ type: 'phase', phase: 'starting', model: `${snapshot.config.provider}/${snapshot.config.model}` });
-        const modelRuntime = await dependencies.createRuntime(controller.signal);
-        // Re-read after admission: queued workers receive the current starting
-        // instructions and repo skill, not the versions present before waiting.
-        const freshSnapshot = { ...snapshot, ...await loadWorkerContext(root, snapshot.config) };
-        controller.signal.throwIfAborted();
-        const result = await runInvestigation({ snapshot: freshSnapshot, request, cwd: ctx.cwd, signal: controller.signal, modelRuntime, store, agent: previous, name });
-        // Synchronously from here: no message can arrive between reading the inbox and leaving the registry.
-        stopListening();
-        const late = store.state().inbox ?? [];
+        const result = await investigate({ args: rest, previous, name, railIndex, store, signal: run.controller.signal, started, cwd: ctx.cwd },
+          reason => run.controller.abort(reason));
+        const late = takeLate(name, store);
         keepAgent(result.agent);
+        if (late.length) resume = { agent: result.agent, late };
         store.dispatch({ type: 'phase', phase: 'completed' });
-        if (late.length && ctx.hasUI) ctx.ui.notify(`${name ?? 'The investigator'} finished before reading ${late.length === 1 ? 'your message' : `${late.length} of your messages`}; continue it to follow up.`, 'warning');
         return {
           content: [{ type: 'text' as const, text: withHeader(result.agent, result.text, late) }],
           details: { requestId, snapshot: runSnapshot(store.state()), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0, agent: agentHandle(result.agent), ...(name ? { name } : {}), agentStatus: status(result.agent) },
           usage: result.usage,
         };
       } catch (error) {
-        stopListening();
-        const late = store.state().inbox ?? [];
-        const e = error as Error & { usage?: ReturnType<typeof zeroUsage>; turns?: number; agent?: InvestigationAgent };
+        const late = takeLate(name, store);
+        const e = error as Failure;
         if (e.agent) keepAgent(e.agent);
         // A continuation that failed before its run started leaves the agent unchanged and still usable.
         const agent = e.agent ?? previous;
-        store.dispatch({ type: 'phase', phase: controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
+        if (late.length && agent && !closed) resume = { agent, late };
+        else if (late.length) notify(`${name ?? 'The investigator'} stopped before it could read your message.`, 'warning');
+        store.dispatch({ type: 'phase', phase: run.controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
         return {
-          content: [{ type: 'text' as const, text: withHeader(agent, `Investigation failed or incomplete: ${e.message}`, late) }],
+          content: [{ type: 'text' as const, text: withHeader(agent, `Investigation failed or incomplete: ${e.message}`, resume ? late : []) }],
           details: { requestId, snapshot: runSnapshot(store.state()), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(name ? { name } : {}), ...(agent ? { agent: agentHandle(agent), agentStatus: status(agent) } : {}) },
           usage: e.usage ?? zeroUsage(), isError: true,
         };
       } finally {
-        stopListening();
+        takeLate(name, store);
         store.close();
-        if (timer) clearTimeout(timer);
-        signal?.removeEventListener('abort', cancel);
         if (reserved) busy.delete(reserved);
-        release(); active.delete(call); finish();
+        run.end();
+        // After releasing this call's reservation, so the new run can take it.
+        if (resume && !closed) {
+          resumeForUser(resume.agent, resume.late);
+          notify(`${name} finished while you were writing; it continues with your message and reports back when done.`, 'info');
+        }
       }
     },
   });

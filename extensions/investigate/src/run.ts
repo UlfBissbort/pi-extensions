@@ -171,7 +171,12 @@ export function steps(agent: InvestigationAgent | undefined, streaming?: Streami
   let run = 0, turn = 0;
   for (const e of agent?.context_ ?? []) {
     switch (e.__type) {
-      case 'ET.InvestigationRequest': run++; out.push({ id: `run:${run}:request`, kind: 'request', question: String(e.request.question ?? '') }); break;
+      case 'ET.InvestigationRequest': {
+        run++;
+        const text = String(e.request.question ?? '');
+        out.push(e.from === 'user' ? { id: `run:${run}:request`, kind: 'user', text } : { id: `run:${run}:request`, kind: 'request', question: text });
+        break;
+      }
       case 'ET.LLMResponse': turn++; out.push(...responseSteps(turn, e.content, false)); break;
       case 'ET.ToolResult': {
         // A result resolves its call in the latest response.

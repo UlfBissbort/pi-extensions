@@ -407,63 +407,202 @@ test('extension results start with the agent handle, continue by handle, and rej
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+// A fake Pi for the extension: handlers, tools, sent messages, widgets, notices, completion.
+async function extensionHarness(dir, script) {
+  const config = structuredClone(snapshot.config);
+  config.instructionsFile = join(root, 'prompts/worker.md');
+  config.parentPromptFile = join(root, 'prompts/parent.md');
+  config.repositoryMapFile = join(root, 'repository-map.md');
+  await writeFile(join(dir, 'config.json'), JSON.stringify(config));
+  const h = { handlers: {}, tools: [], contexts: [], notes: [], sent: [], widgets: new Map(), widgetLog: [], providers: [] };
+  let delivered;
+  h.nextMessage = () => new Promise(resolve => { delivered = resolve; });
+  const pi = {
+    on: (name, fn) => h.handlers[name] = fn,
+    registerTool: t => h.tools.push(t),
+    registerMessageRenderer: (type, fn) => h.renderer = fn,
+    sendMessage: (message, options) => { h.sent.push({ message, options }); delivered?.(h.sent.at(-1)); },
+  };
+  const tui = { requestRender() {} };
+  const theme = { fg: (_c, t) => t, bg: (_c, t) => t, bold: t => t, style: (_s, t) => t, colors: {} };
+  h.ui = {
+    notify: (text, level) => h.notes.push([level, text]),
+    setWidget: (key, factory) => {
+      h.widgetLog.push([key, !!factory]);
+      if (factory) h.widgets.set(key, factory(tui, theme)); else h.widgets.delete(key);
+    },
+    addAutocompleteProvider: factory => h.providers.push(factory),
+  };
+  await registerInvestigation(pi, dir, {
+    createRuntime: async () => scriptedRuntime(async (turn, context, options) => {
+      h.contexts.push(structuredClone(context));
+      return script(turn, context, options);
+    }),
+  });
+  h.input = text => h.handlers.input({ type: 'input', text, source: 'interactive', streamingBehavior: 'steer' }, { hasUI: true, ui: h.ui });
+  h.ctx = { cwd: dir, hasUI: true, ui: h.ui };
+  h.theme = theme;
+  return h;
+}
+const lastUserText = context => context.messages.at(-1).content[0].text;
+
 test('names are shown from launch, never reused, and @name messages reach the running investigator', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'investigate-names-'));
   try {
-    const config = structuredClone(snapshot.config);
-    config.instructionsFile = join(root, 'prompts/worker.md');
-    config.parentPromptFile = join(root, 'prompts/parent.md');
-    config.repositoryMapFile = join(root, 'repository-map.md');
-    await writeFile(join(dir, 'config.json'), JSON.stringify(config));
-    const handlers = {}, tools = [], contexts = [], notes = [];
     let release;
     const gate = new Promise(resolve => { release = resolve; });
-    await registerInvestigation({ on: (name, fn) => handlers[name] = fn, registerTool: t => tools.push(t) }, dir, {
-      createRuntime: async () => scriptedRuntime(async (turn, context) => {
-        contexts.push(structuredClone(context));
-        if (JSON.stringify(context).includes('Wait for me')) {
-          if (turn === 0) { await gate; return [call('ls', { path: dir }, 'l1')]; }
-        }
-        return [submit('Done')];
-      }),
+    const h = await extensionHarness(dir, async (turn, context) => {
+      if (JSON.stringify(context).includes('Wait for me') && h.contexts.length === 1) { await gate; return [call('ls', { path: dir }, 'l1')]; }
+      return [submit('Done')];
     });
-    const ui = { notify: (text, level) => notes.push([level, text]), setWidget() {} };
     // A name shown earlier in this session (e.g. before a reload) is never issued again.
     const taken = 'hypatia_the_patient';
     const entries = [{ type: 'message', message: { role: 'toolResult', toolName: 'investigate', details: { name: taken } } }];
-    await handlers.session_start({}, { hasUI: false, sessionManager: { getEntries: () => entries } });
-    const tool = tools[0];
+    await h.handlers.session_start({}, { hasUI: false, sessionManager: { getEntries: () => entries } });
+    const tool = h.tools[0];
     const updates = [];
-    const pending = tool.execute('a', { question: 'Wait for me' }, undefined, u => updates.push(u), { cwd: dir, hasUI: true, ui });
+    const pending = tool.execute('a', { question: 'Wait for me' }, undefined, u => updates.push(u), h.ctx);
     await new Promise(resolve => setTimeout(resolve, 20));
     const name = updates[0].details.snapshot.name;
     assert(name && name !== taken, 'the name is known at launch, before the agent record exists');
     const prefix = name.slice(0, name.length - 2);
-    const input = text => handlers.input({ type: 'input', text, source: 'interactive', streamingBehavior: 'steer' }, { hasUI: true, ui });
     // Addressed by unique prefix with an ellipsis, while the first model request is still out.
-    assert.deepEqual(await input(`@${prefix}… look in the tests instead`), { action: 'handled' });
-    assert.match(notes.at(-1)[1], new RegExp(`^Sent to ${name}`));
+    assert.deepEqual(await h.input(`@${prefix}… look in the tests instead`), { action: 'handled' });
+    assert.match(h.notes.at(-1)[1], new RegExp(`^Sent to ${name}`));
     assert.equal(updates.at(-1).details.snapshot.pendingMessages, 1);
-    assert.deepEqual(await input('@nobody_known hello'), { action: 'continue' }, 'unknown names are ordinary parent input');
-    assert.deepEqual(await input('no address here'), { action: 'continue' });
+    assert.deepEqual(await h.input('@nobody_known hello'), { action: 'continue' }, 'unknown names are ordinary parent input');
+    assert.deepEqual(await h.input('no address here'), { action: 'continue' });
     release();
     const result = await pending;
     assert(!result.isError, result.content[0].text);
     // Delivered at the turn boundary: after the tool result, before the next model request.
-    const roles = contexts.at(-1).messages.map(m => m.role);
+    const roles = h.contexts.at(-1).messages.map(m => m.role);
     assert.deepEqual(roles.slice(-3), ['assistant', 'toolResult', 'user']);
-    assert.match(contexts.at(-1).messages.at(-1).content[0].text, /^Message from the human user[\s\S]*look in the tests instead$/);
+    assert.match(lastUserText(h.contexts.at(-1)), /^Message from the human user[\s\S]*look in the tests instead$/);
     const text = result.content[0].text;
     assert(text.startsWith(`${name} = ${result.details.agent} answered\n\nThe user sent this investigator messages during this call`), text);
     assert(text.includes('- "look in the tests instead"'));
     assert(result.details.snapshot.steps.some(s => s.kind === 'user' && s.text === 'look in the tests instead'));
-    // Finished investigators cannot read messages; the user is told so.
-    assert.deepEqual(await input(`@${name} one more thing`), { action: 'handled' });
-    assert.match(notes.at(-1)[1], /is not running/);
     // A parallel investigator gets a different name.
-    const other = await tool.execute('b', { question: 'Other' }, undefined, undefined, { cwd: dir });
+    const other = await tool.execute('b', { question: 'Other' }, undefined, undefined, h.ctx);
     assert.notEqual(other.details.name, name);
     assert.notEqual(other.details.name, taken);
-    await handlers.session_shutdown();
+    await h.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('writing to a finished investigator resumes it in a live widget and reports to the parent in its own colour', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-resume-'));
+  try {
+    const h = await extensionHarness(dir, async (_turn, context) =>
+      [submit(lastUserText(context).includes('one more thing') ? 'Second answer' : 'First answer')]);
+    await h.handlers.session_start({}, { hasUI: true, ui: h.ui, sessionManager: { getEntries: () => [] } });
+    const first = await h.tools[0].execute('a', { question: 'Start', effort: 1, detail: 'brief' }, undefined, undefined, h.ctx);
+    const { name, agent: handle } = first.details;
+    const rail = first.details.snapshot.railIndex;
+    const delivered = h.nextMessage();
+    assert.deepEqual(await h.input(`@${name} one more thing`), { action: 'handled' });
+    assert.match(h.notes.at(-1)[1], new RegExp(`^Resuming ${name}`));
+    // While it runs, the chain is a widget above the editor.
+    const runWidgets = () => [...h.widgets.keys()].filter(k => k.startsWith('investigate-run-'));
+    assert.equal(runWidgets().length, 1);
+    const widgetLines = h.widgets.get(runWidgets()[0]).render(100);
+    assert(widgetLines[0].includes(name), widgetLines.join('\n'));
+    const { message, options } = await delivered;
+    assert.deepEqual(options, { triggerTurn: true, deliverAs: 'followUp' });
+    assert.equal(message.customType, 'investigation-report');
+    assert.equal(message.display, true);
+    assert(message.content.startsWith(`${name} = ${handle} answered\n\nThe user resumed this investigator directly`), message.content);
+    assert(message.content.includes('- "one more thing"') && message.content.includes('Second answer'));
+    assert.equal(runWidgets().length, 0, 'the widget is gone once the box is in the transcript');
+    // The model saw the whole first run, then the user's message with this run's limits.
+    const context = h.contexts.at(-1);
+    assert(JSON.stringify(context).includes('First answer'));
+    assert.equal(context.messages.filter(m => m.role === 'system').length, 1);
+    assert.match(lastUserText(context), /^The human user resumes this investigation[\s\S]*At most \d+ model requests[\s\S]*one more thing$/);
+    // Same agent, same name, same colour; the box shows the user's message first in the new run.
+    const details = message.details;
+    assert.equal(details.agent, handle);
+    assert.equal(details.name, name);
+    assert.equal(details.snapshot.railIndex, rail);
+    const runSteps = details.snapshot.steps.slice(details.snapshot.steps.findIndex(s => s.id === 'run:2:request'));
+    assert.deepEqual(runSteps.map(s => s.kind), ['user', 'submit', 'end']);
+    assert.equal(runSteps[0].text, 'one more thing');
+    // The transcript box renders from the message alone.
+    const lines = h.renderer(message, { expanded: false }, h.theme).render(100);
+    assert(lines[0].includes(name) && lines.some(l => l.includes('one more thing')), lines.join('\n'));
+    // The parent can continue it afterwards as usual.
+    const third = await h.tools[0].execute('b', { agent: name, question: 'Third' }, undefined, undefined, h.ctx);
+    assert(!third.isError, third.content[0].text);
+    assert.equal(third.details.snapshot.railIndex, rail, 'a parent continuation keeps the colour too');
+    await h.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a message sent while the investigator submits its answer starts a resumed run right after', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-late-'));
+  try {
+    let release, started;
+    const gate = new Promise(resolve => { release = resolve; });
+    const inFinal = new Promise(resolve => { started = resolve; });
+    const h = await extensionHarness(dir, async (_turn, context) => {
+      if (lastUserText(context).includes('also check the docs')) return [submit('Docs checked')];
+      started(); await gate; return [submit('Main answer')];
+    });
+    await h.handlers.session_start({}, { hasUI: true, ui: h.ui, sessionManager: { getEntries: () => [] } });
+    const updates = [];
+    const pending = h.tools[0].execute('a', { question: 'Main' }, undefined, u => updates.push(u), h.ctx);
+    await inFinal;
+    const name = updates.at(-1).details.snapshot.name;
+    await h.input(`@${name} also check the docs`);
+    const delivered = h.nextMessage();
+    release();
+    const result = await pending;
+    assert(!result.isError);
+    assert(result.content[0].text.includes('while it was finishing; it continues with them now and reports back in a separate message:\n- "also check the docs"'), result.content[0].text);
+    const { message } = await delivered;
+    assert(message.content.includes('The user resumed this investigator directly') && message.content.includes('Docs checked'), message.content);
+    assert.equal(message.details.name, name);
+    await h.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('@ autocompletes running and finished investigators and leaves other completions alone', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-complete-'));
+  try {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const h = await extensionHarness(dir, async (_turn, context) => {
+      if (lastUserText(context).includes('Slow')) await gate;
+      return [submit('ok')];
+    });
+    await h.handlers.session_start({}, { hasUI: true, ui: h.ui, sessionManager: { getEntries: () => [] } });
+    const fallback = { triggerCharacters: ['/'], getSuggestions: async () => ({ prefix: 'file', items: [{ value: 'src/', label: 'src/' }] }), applyCompletion: () => ({ lines: ['file'], cursorLine: 0, cursorCol: 4 }) };
+    assert.equal(h.providers.length, 1);
+    const provider = h.providers[0](fallback);
+    assert.deepEqual(provider.triggerCharacters.sort(), ['/', '@']);
+    const done = await h.tools[0].execute('a', { question: 'Fast' }, undefined, undefined, h.ctx);
+    const updates = [];
+    const slow = h.tools[0].execute('b', { question: 'Slow' }, undefined, u => updates.push(u), h.ctx);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const live = updates.at(-1).details.snapshot.name;
+    const signal = new AbortController().signal;
+    const all = await provider.getSuggestions(['@'], 0, 1, { signal });
+    assert.equal(all.prefix, '@');
+    assert.deepEqual(all.items.map(i => i.value), [live, done.details.name], 'running first, then finished');
+    assert.match(all.items[0].description, /running|starting|queued/);
+    assert.match(all.items[1].description, /resumes with your message/);
+    // Any part of a name matches.
+    const part = live.split('_').at(-1);
+    assert((await provider.getSuggestions([`@${part}`], 0, part.length + 1, { signal })).items.some(i => i.value === live));
+    // Not an address: elsewhere in the text, or no matching name, goes to Pi's completion.
+    assert.equal((await provider.getSuggestions(['see @'], 0, 5, { signal })).prefix, 'file');
+    assert.equal((await provider.getSuggestions(['@src/ma'], 0, 7, { signal })).prefix, 'file');
+    const applied = provider.applyCompletion(['@ki rest'], 0, 3, all.items[0], '@ki');
+    assert.deepEqual(applied, { lines: [`@${live} rest`], cursorLine: 0, cursorCol: live.length + 2 });
+    assert.deepEqual(provider.applyCompletion(['x'], 0, 1, { value: 'src/', label: 'src/' }, 'x'), { lines: ['file'], cursorLine: 0, cursorCol: 4 });
+    release();
+    await slow;
+    await h.handlers.session_shutdown();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
