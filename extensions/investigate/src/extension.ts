@@ -12,9 +12,11 @@ import {
 } from './agent.ts';
 import { addressToken, applyAddress, completeAddress, firstPart, NAMES, parseAddress, pickName, resolveName, type Candidate } from './names.ts';
 import { setTui } from './scroll.ts';
+import { AGENT_ENTRY, delta, loadAgents } from './persist.ts';
 
-// Agents stay in memory after their run so a later step can resume them. Oldest
-// agents are dropped first once the cap is reached.
+// Agents stay in memory after their run so a later step can resume them, and are
+// saved in the session so a reload keeps them. Oldest agents are dropped from
+// memory first once the cap is reached.
 const MAX_AGENTS = 100;
 // Custom message type of the result of a run the user started, sent to the parent.
 export const REPORT = 'investigation-report';
@@ -51,10 +53,18 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
   const slots = createSemaphore(initial.config.limits.maxConcurrentInvestigations);
   const active = new Set<{ controller: AbortController; done: Promise<void> }>();
   const agents = new Map<Uid, InvestigationAgent>();
+  // How much of each agent's record the session already holds.
+  const saved = new Map<Uid, number>();
   const keepAgent = (agent: InvestigationAgent) => {
     agents.delete(agent.__uid);
     agents.set(agent.__uid, agent);
     while (agents.size > MAX_AGENTS) agents.delete(agents.keys().next().value!);
+    const added = delta(agent, saved.get(agent.__uid) ?? 0);
+    if (!added) return;
+    try {
+      pi.appendEntry?.(AGENT_ENTRY, added);
+      saved.set(agent.__uid, agent.context_.length);
+    } catch { /* Without a session the agent still lives in memory. */ }
   };
   // One writer per agent: a continued agent is reserved from call start, queueing included.
   const busy = new Set<Uid>();
@@ -238,6 +248,14 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     } else delete event.systemPromptOptions.sections.investigation;
   });
   pi.on('session_start', async (_event, ctx) => {
+    // Agents saved on the active branch come back, with their names and colours.
+    for (const agent of loadAgents(ctx.sessionManager?.getBranch?.() ?? []).slice(-MAX_AGENTS)) {
+      agents.set(agent.__uid, agent);
+      saved.set(agent.__uid, agent.context_.length);
+      const name = agentName(agent);
+      if (name) issued.add(name);
+      nextRailIndex = Math.max(nextRailIndex, (railOf(agent) ?? -1) + 1);
+    }
     // Every name this session ever showed, on any branch, stays taken.
     for (const entry of ctx.sessionManager?.getEntries?.() ?? []) {
       const message = (entry as { type?: string; message?: { role?: string; toolName?: string; customType?: string; details?: { name?: unknown } } }).message;
@@ -271,7 +289,7 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     if (known.kind !== 'one') return { action: 'continue' };
     const agent = byName(known.name);
     if (!agent) {
-      notify(`${known.name} is no longer retained (evicted or lost on reload), so it cannot resume. Ask the parent for a new investigation.`, 'warning');
+      notify(`${known.name} is not available on this branch of the session (or was evicted), so it cannot resume. Ask the parent for a new investigation.`, 'warning');
       return { action: 'handled' };
     }
     if (busy.has(agent.__uid)) {
@@ -317,7 +335,7 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
       if (address !== undefined) {
         const uid = findAgent(address);
         if (!uid) lookupError = handleUid(address) || NAMES.includes(address.replace(/_\d+$/, '')) || issued.has(address)
-          ? `Unknown agent ${address}: not retained here (never started in this session, evicted, or lost on reload). Start a new investigation and pass what it needs in context`
+          ? `Unknown agent ${address}: not retained here (never started on this branch of the session, or evicted). Start a new investigation and pass what it needs in context`
           : `Invalid agent: ${address} is neither an investigator name nor a handle`;
         else if (busy.has(uid)) refusal = { uid, ...(agentName(agents.get(uid)!) ? { name: agentName(agents.get(uid)!) } : {}) };
         else { previous = agents.get(uid); busy.add(reserved = uid); }

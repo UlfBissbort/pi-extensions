@@ -408,7 +408,7 @@ test('extension results start with the agent handle, continue by handle, and rej
 });
 
 // A fake Pi for the extension: handlers, tools, sent messages, widgets, notices, completion.
-async function extensionHarness(dir, script) {
+async function extensionHarness(dir, script, session = []) {
   const config = structuredClone(snapshot.config);
   config.instructionsFile = join(root, 'prompts/worker.md');
   config.parentPromptFile = join(root, 'prompts/parent.md');
@@ -422,7 +422,10 @@ async function extensionHarness(dir, script) {
     registerTool: t => h.tools.push(t),
     registerMessageRenderer: (type, fn) => h.renderer = fn,
     sendMessage: (message, options) => { h.sent.push({ message, options }); delivered?.(h.sent.at(-1)); },
+    appendEntry: (customType, data) => session.push(structuredClone({ type: 'custom', customType, data })),
   };
+  h.session = session;
+  h.start = () => h.handlers.session_start({}, { hasUI: true, ui: h.ui, sessionManager: { getEntries: () => session, getBranch: () => session } });
   const tui = { requestRender() {} };
   const theme = { fg: (_c, t) => t, bg: (_c, t) => t, bold: t => t, style: (_s, t) => t, colors: {} };
   h.ui = {
@@ -604,5 +607,44 @@ test('@ autocompletes running and finished investigators and leaves other comple
     release();
     await slow;
     await h.handlers.session_shutdown();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('finished investigators survive a reload: suggested, resumable, and continued with their context', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'investigate-reload-'));
+  try {
+    const script = async (_turn, context) => [submit(lastUserText(context).includes('Start') ? 'First answer' : 'Later answer')];
+    const before = await extensionHarness(dir, script);
+    await before.start();
+    const first = await before.tools[0].execute('a', { question: 'Start' }, undefined, undefined, before.ctx);
+    const second = await before.tools[0].execute('b', { agent: first.details.name, question: 'More' }, undefined, undefined, before.ctx);
+    assert(!second.isError);
+    const deltas = before.session.filter(e => e.customType === 'investigation-agent');
+    assert.equal(deltas.length, 2, 'one save per finished run');
+    assert.equal(deltas[1].data.from, deltas[0].data.entries.length, 'the second save holds only the new entries');
+    await before.handlers.session_shutdown();
+
+    // A reload: a fresh extension instance on the same session.
+    const after = await extensionHarness(dir, script, before.session);
+    await after.start();
+    const { name, agent: handle } = first.details;
+    const provider = after.providers[0]({ getSuggestions: async () => null, applyCompletion: () => ({}) });
+    const items = (await provider.getSuggestions(['@'], 0, 1, { signal: new AbortController().signal })).items;
+    assert.deepEqual(items.map(i => i.value), [name]);
+    // The parent continues it by name, with the whole history from before the reload.
+    const third = await after.tools[0].execute('c', { agent: name, question: 'After reload' }, undefined, undefined, after.ctx);
+    assert(!third.isError, third.content[0].text);
+    assert.equal(third.details.agent, handle);
+    assert.equal(third.details.snapshot.railIndex, first.details.snapshot.railIndex);
+    const context = JSON.stringify(after.contexts.at(-1));
+    assert(context.includes('First answer') && context.includes('Later answer'));
+    // The user can resume it too.
+    const delivered = after.nextMessage();
+    assert.deepEqual(await after.input(`@${name} and once more`), { action: 'handled' });
+    assert((await delivered).message.content.startsWith(`${name} = ${handle} answered`));
+    // A new investigator does not reuse the name.
+    const fresh = await after.tools[0].execute('d', { question: 'Start again' }, undefined, undefined, after.ctx);
+    assert.notEqual(fresh.details.name, name);
+    await after.handlers.session_shutdown();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

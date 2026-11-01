@@ -94,7 +94,7 @@ Before answering the user, match every requested target against the actual retur
 
 Continue an investigator when the next question builds on what it found: a follow-up, a correction, more source for something it located, or finishing a `resumable` run. It keeps its full previous context, including every file it read and its earlier answers, so it does not repeat the search; ask only for what is new. Start a new investigator for an unrelated question; its context is then small and focused. Each continuation resends the whole earlier history, so stop continuing once the topic has moved on.
 
-An investigator handles one call at a time. Do not continue the same handle in parallel calls; to explore several directions at once, start separate investigators. Names and handles last only while the extension stays loaded and only for recent investigators; an unknown one returns an error, after which start a new investigation and pass what it needs in `context`.
+An investigator handles one call at a time. Do not continue the same handle in parallel calls; to explore several directions at once, start separate investigators. Investigators are kept with this session, also across reloads, but only those from the current session branch and the most recent 100; an unknown name or handle returns an error, after which start a new investigation and pass what it needs in `context`.
 
 ### Parallel investigations
 
