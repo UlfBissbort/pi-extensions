@@ -18,7 +18,8 @@ snapshot.config.limits.maxTurns = 4;
 // Test only the protocol; do not expose the repository map or perform real research.
 snapshot.repositoryMap = 'This is a synthetic smoke test. Only inspect the supplied fixture.';
 const dir = await mkdtemp(join(tmpdir(), 'investigate-live-'));
-const progressEvents = [];
+const uiMsgs = [];
+let agent;
 const controller = new AbortController();
 const timer = setTimeout(() => controller.abort(new Error('Smoke test timed out')), 60000);
 try {
@@ -27,15 +28,17 @@ try {
   const runtime = await ModelRuntime.create({ signal: controller.signal });
   console.log(`Testing ${snapshot.config.provider}/${snapshot.config.model} (${snapshot.config.thinkingLevel})`);
   const result = await runInvestigation({ snapshot, cwd: dir, signal: controller.signal, modelRuntime: runtime,
-    onProgress: event => progressEvents.push(event),
+    onUi: msg => uiMsgs.push(msg), onAgent: a => { agent = a; },
     request: { question: `Read ${path}, then call submit_answer alone with text exactly "Smoke test passed." and one excerpt for that file, start_line 2, end_line 2. No other research is necessary.`, detail: 'brief', include_references: false },
   });
   assert(result.text.includes('Smoke test passed.'));
   assert(result.text.includes('  "live excerpt" & <source>\n'));
   assert.equal(result.excerpts.length, 1);
-  assert(progressEvents.some(e => e.type === 'entry' && e.kind === 'tool completed' && e.text.includes('read ')));
-  assert(progressEvents.some(e => e.type === 'entry' && e.kind === 'answer draft' && e.text.includes('Smoke test passed.')));
-  assert(progressEvents.some(e => e.type === 'entry' && e.kind === 'excerpt captured'));
-  console.log(JSON.stringify({ success: true, model: result.model, turns: result.turns, usage: result.usage, progressEvents: progressEvents.length }));
+  const { agentBlocks } = await jiti.import('../src/view.ts');
+  const blocks = agentBlocks(agent);
+  assert(blocks.some(b => b.kind === 'tool' && b.status === 'ok' && b.title.startsWith('read ')));
+  assert(blocks.some(b => b.kind === 'submit' && b.status === 'ok' && b.text.includes('Smoke test passed.')));
+  assert(uiMsgs.some(m => m.type === 'streaming'), 'streamed partial responses reach the UI');
+  console.log(JSON.stringify({ success: true, model: result.model, turns: result.turns, usage: result.usage, uiMsgs: uiMsgs.length }));
   console.log(result.text);
 } finally { clearTimeout(timer); await rm(dir, { recursive: true, force: true }); }

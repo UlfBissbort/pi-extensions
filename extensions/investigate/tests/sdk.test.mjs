@@ -221,12 +221,13 @@ test('full extension pipeline queues independent calls, returns text/usage, and 
       assert(updates.length > 3);
       assert(updates.every(u => u.content.length === 0));
       assert(updates.every(u => u.details.requestId === results[i].details.requestId));
-      assert(updates.every(u => u.details.progress.requestId === results[i].details.requestId));
-      assert.equal(updates[0].details.progress.phase, 'queued');
-      assert.equal(updates.at(-1).details.progress.phase, 'completed');
+      assert(updates.every(u => u.details.view.requestId === results[i].details.requestId));
+      assert.equal(updates[0].details.view.phase, 'queued');
+      assert.equal(updates.at(-1).details.view.phase, 'completed');
+      assert.equal(updates.at(-1).details.view.handle, results[i].details.agent);
     }
     assert.notEqual(results[0].details.requestId, results[1].details.requestId);
-    assert.equal(updatesA[0].details.progress.entries.length, 1, 'Published snapshots must not mutate');
+    assert.equal(updatesA[0].details.view.blocks.length, 0, 'Published snapshots must not mutate');
     await handlers.session_shutdown();
 
     const handlers2 = {}, tools2 = [];
@@ -263,7 +264,7 @@ test('parent SDK → investigate → worker SDK → parent receives only final p
     // Bounded UI history may be stored in tool details for replay; it must not
     // enter model-facing content. Provider serialization is tested separately.
     assert(!JSON.stringify(result.content).includes('PRIVATE_WORKER_DRAFT'));
-    assert(JSON.stringify(result.details.progress).includes('PRIVATE_WORKER_DRAFT'), 'UI history remains inspectable');
+    assert(JSON.stringify(result.details.view).includes('PRIVATE_WORKER_DRAFT'), 'UI history remains inspectable');
     const model = parentRuntime.getModel(snapshot.config.provider, snapshot.config.model);
     const wire = convertResponsesMessages(model, context, new Set(['openai-codex']));
     assert(!JSON.stringify(wire).includes('PRIVATE_WORKER_DRAFT'), 'UI history must not be serialized to the parent provider');

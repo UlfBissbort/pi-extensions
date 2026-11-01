@@ -3,7 +3,7 @@ import { ModelRuntime, type ExtensionAPI } from '@earendil-works/pi-coding-agent
 import { loadConfig, loadWorkerContext } from './config.mjs';
 import { createSemaphore, limitsForEffort, normalizeRequest, zeroUsage } from './core.mjs';
 import { requestSchema, runInvestigation } from './worker.ts';
-import { createProgressReporter } from './progress.ts';
+import { init, update, view, type AgentView, type UiMsg } from './view.ts';
 import { renderInvestigationCall, renderInvestigationResult } from './render.ts';
 import { status, type InvestigationAgent, type Uid } from './agent.ts';
 
@@ -11,6 +11,30 @@ import { status, type InvestigationAgent, type Uid } from './agent.ts';
 // agents are dropped first once the cap is reached.
 const MAX_AGENTS = 100;
 const agentHandle = (agent: InvestigationAgent) => `ET.InvestigationAgent('${agent.__uid}')`;
+
+// The Elm-style runtime at the edge: holds the UI model, applies update(), and
+// publishes view(). Streaming text is coalesced to at most one publish per 100 ms.
+function createUiStore(requestId: string, publish: (view: AgentView) => void) {
+  let model = init(requestId);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    if (closed) return;
+    try { publish(view(model)); } catch { /* UI failure must not abort a paid investigation. */ }
+  };
+  return {
+    dispatch(msg: UiMsg) {
+      if (closed) return;
+      model = update(model, msg);
+      if (msg.type !== 'streaming') flush();
+      else if (!timer) timer = setTimeout(flush, 100);
+    },
+    view: () => view(model),
+    close() { if (timer) clearTimeout(timer); timer = undefined; closed = true; },
+  };
+}
 
 export async function registerInvestigation(pi: ExtensionAPI, root: string, dependencies = {
   createRuntime: (signal: AbortSignal) => ModelRuntime.create({ signal }),
@@ -44,6 +68,8 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
     promptGuidelines: ['Prefer investigate for information gathering, including ordinary lookups. Ask independent questions in parallel calls.'],
     parameters: requestSchema,
     executionMode: 'parallel',
+    // The chain of step boxes is its own frame; Pi's default boxed shell would nest it.
+    renderShell: 'self',
     renderCall: renderInvestigationCall,
     renderResult: renderInvestigationResult,
     // Unrestricted shell is available by default, so do not claim read-only safety.
@@ -60,11 +86,11 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
       active.add(call);
       const started = Date.now();
       const requestId = randomUUID();
-      const progress = createProgressReporter(requestId, started, state => {
+      const ui = createUiStore(requestId, state => {
         // Partial updates are UI events, not parent-model transcript messages.
-        onUpdate?.({ content: [], details: { requestId, progress: state } });
+        onUpdate?.({ content: [], details: { requestId, view: state } });
       });
-      progress.emit({ type: 'phase', phase: 'queued', text: 'Request accepted; waiting for an investigation slot.' });
+      ui.dispatch({ type: 'phase', phase: 'queued', note: 'Waiting for an investigation slot.' });
       let timer: ReturnType<typeof setTimeout> | undefined;
       let release = () => {};
       try {
@@ -76,30 +102,29 @@ export async function registerInvestigation(pi: ExtensionAPI, root: string, depe
         timer = setTimeout(() => controller.abort(new Error('Investigation deadline exceeded')), remaining);
         slots.setLimit(snapshot.config.limits.maxConcurrentInvestigations);
         release = await slots.acquire(controller.signal);
-        progress.emit({ type: 'phase', phase: 'starting', text: 'Preparing model access and fresh starting context.', model: `${snapshot.config.provider}/${snapshot.config.model}` });
+        ui.dispatch({ type: 'phase', phase: 'starting', model: `${snapshot.config.provider}/${snapshot.config.model}` });
         const modelRuntime = await dependencies.createRuntime(controller.signal);
         // Re-read after admission: queued workers receive the current starting
         // instructions and repo skill, not the versions present before waiting.
         const freshSnapshot = { ...snapshot, ...await loadWorkerContext(root, snapshot.config) };
         controller.signal.throwIfAborted();
-        progress.emit({ type: 'entry', key: 'context', kind: 'context loaded', text: `Initial prompt: ${snapshot.config.instructionsFile}\nRepo overview: ${snapshot.config.repositoryMapFile}` });
-        const result = await runInvestigation({ snapshot: freshSnapshot, request, cwd: ctx.cwd, signal: controller.signal, modelRuntime, onProgress: progress.emit, onAgent: keepAgent });
-        progress.emit({ type: 'phase', phase: 'completed', text: `Investigation finished; ${result.excerpts.length} excerpts included${result.warnings.length ? `, ${result.warnings.length} evidence warnings` : ''}.` });
+        const result = await runInvestigation({ snapshot: freshSnapshot, request, cwd: ctx.cwd, signal: controller.signal, modelRuntime, onUi: ui.dispatch, onAgent: agent => { keepAgent(agent); ui.dispatch({ type: 'agent', agent }); } });
+        ui.dispatch({ type: 'phase', phase: 'completed' });
         return {
           content: [{ type: 'text' as const, text: result.text }],
-          details: { requestId, progress: progress.snapshot(), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0, agent: agentHandle(result.agent), agentStatus: status(result.agent) },
+          details: { requestId, view: ui.view(), model: result.model, turns: result.turns, elapsedMs: Date.now() - started, excerpts: result.excerpts, incompleteEvidence: result.warnings.length > 0, agent: agentHandle(result.agent), agentStatus: status(result.agent) },
           usage: result.usage,
         };
       } catch (error) {
         const e = error as Error & { usage?: ReturnType<typeof zeroUsage>; turns?: number; agent?: InvestigationAgent };
-        progress.emit({ type: 'phase', phase: controller.signal.aborted ? 'cancelled' : 'failed', text: e.message });
+        ui.dispatch({ type: 'phase', phase: controller.signal.aborted ? 'cancelled' : 'failed', note: e.message });
         return {
           content: [{ type: 'text' as const, text: `Investigation failed or incomplete: ${e.message}` }],
-          details: { requestId, progress: progress.snapshot(), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(e.agent ? { agent: agentHandle(e.agent), agentStatus: status(e.agent) } : {}) },
+          details: { requestId, view: ui.view(), turns: e.turns ?? 0, elapsedMs: Date.now() - started, ...(e.agent ? { agent: agentHandle(e.agent), agentStatus: status(e.agent) } : {}) },
           usage: e.usage ?? zeroUsage(), isError: true,
         };
       } finally {
-        progress.close();
+        ui.close();
         if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', cancel);
         release(); active.delete(call); finish();

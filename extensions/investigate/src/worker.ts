@@ -7,7 +7,7 @@ import {
   type ModelRuntime, type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
 import { assembleResponse, limitsForEffort, validateSubmission } from './core.mjs';
-import { createWorkerProgress, type ProgressEvent } from './progress.ts';
+import type { UiMsg } from './view.ts';
 import {
   acceptedSubmission, append, config as agentConfig, currentRun, nextStep, render, status, SUBMIT, turnsInRun, usage,
   type Entry, type InvestigationAgent, type LLMResponse, type RunEnded, type RunEndReason, type ToolDeclaration, type ToolResult, type Uid,
@@ -61,9 +61,10 @@ const declaration = ({ name, description, parameters, constrainedSampling }: Exe
 // Boundary: runs one investigation as a loop over plain data. Each fact (model
 // response, tool result, run end) is appended to the agent; the next step and the
 // next model context are derived from the agent alone.
-export async function runInvestigation({ snapshot, request, cwd, signal, modelRuntime, onProgress, onAgent }: {
+export async function runInvestigation({ snapshot, request, cwd, signal, modelRuntime, onUi, onAgent }: {
   snapshot: any; request: any; cwd: string; signal: AbortSignal; modelRuntime: ModelRuntime;
-  onProgress?: (event: ProgressEvent, immediate?: boolean) => void;
+  // UI messages for what is not yet a fact; recorded facts arrive through onAgent.
+  onUi?: (msg: UiMsg) => void;
   onAgent?: (agent: InvestigationAgent) => void;
 }) {
   const { config, workerPrompt, repositoryMap } = snapshot;
@@ -75,10 +76,9 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
   };
   const runEnded = (reason: RunEndReason, message?: string): RunEnded =>
     ({ __type: 'ET.RunEnded', __uid: newUid(), reason, ...(message === undefined ? {} : { message }), timestamp: Date.now() });
-  const notify = (event: ProgressEvent, immediate = true) => {
-    try { onProgress?.(event, immediate); } catch { /* Progress observers cannot alter execution. */ }
+  const notify = (msg: UiMsg) => {
+    try { onUi?.(msg); } catch { /* UI observers cannot alter execution. */ }
   };
-  const reportWorkerEvent = createWorkerProgress(notify);
   try {
     signal.throwIfAborted();
     const model = modelRuntime.getModel(config.provider, config.model);
@@ -99,8 +99,6 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
       parameters: submissionSchema,
       async execute(_id, args, toolSignal) {
         const accepted = validateSubmission(args, limits);
-        notify({ type: 'entry', key: 'submitted', kind: 'submitted', text: `Final answer accepted; ${accepted.excerpts.length} excerpt selections.` });
-        notify({ type: 'phase', phase: 'assembling', text: 'Reading selected source excerpts and assembling the final response.' });
         // Reading excerpts touches the file system, so the captured text is part of this fact.
         const response = await assembleResponse(accepted, root, limits, toolSignal);
         return { content: [{ type: 'text', text: 'Answer accepted.' }], details: { submission: accepted, response } };
@@ -121,21 +119,17 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
       cwd: root, tools: declarations, timestamp: now,
     });
     record({ __type: 'ET.InvestigationRequest', __uid: newUid(), request, limits, timestamp: now });
-    notify({ type: 'phase', phase: 'running', text: 'Fresh investigator session started.', model: `${model.provider}/${model.id}` });
+    notify({ type: 'phase', phase: 'running', model: `${model.provider}/${model.id}` });
 
     const callModel = async (): Promise<LLMResponse> => {
-      const turn = turnsInRun(agent) + 1;
-      notify({ type: 'turn', turn });
-      notify({ type: 'entry', key: `turn:${turn}`, kind: 'model', text: `Request ${turn}: gathering information or composing the answer.` });
       const stream = modelRuntime.streamSimple(model, render(agent), {
         reasoning: level === 'off' ? undefined : level, sessionId: agentConfig(agent).sessionId, signal,
         transport: 'auto', timeoutMs: 300000, maxRetries: 0, maxRetryDelayMs: 60000,
       } as any);
       for await (const event of stream) {
-        if ('partial' in event) reportWorkerEvent({ type: 'message_update', assistantMessageEvent: event }, turn);
+        if ('partial' in event) notify({ type: 'streaming', content: event.partial.content });
       }
       const message = await stream.result();
-      reportWorkerEvent({ type: 'message_end', message }, turn);
       const { role: _role, ...fields } = message;
       return { __type: 'ET.LLMResponse', __uid: newUid(), ...fields, thinkingLevel: level } as LLMResponse;
     };
@@ -159,14 +153,6 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
         return { ...base, content: errorText(error), details: {}, isError: true, durationMs: elapsed(), timestamp: Date.now() };
       }
     };
-    const executeTool = async (call: ToolCall): Promise<ToolResult> => {
-      const turn = turnsInRun(agent);
-      reportWorkerEvent({ type: 'tool_execution_start', toolCallId: call.id, toolName: call.name, args: call.arguments }, turn);
-      const result = await runTool(call);
-      reportWorkerEvent({ type: 'tool_execution_end', toolCallId: call.id, toolName: call.name, result, isError: result.isError }, turn);
-      return result;
-    };
-
     while (true) {
       signal.throwIfAborted();
       const step = nextStep(agent);
@@ -179,17 +165,13 @@ export async function runInvestigation({ snapshot, request, cwd, signal, modelRu
         }
       } else {
         // Calls run concurrently; results are recorded in call order.
-        for (const result of await Promise.all(step.calls.map(executeTool))) record(result);
+        for (const result of await Promise.all(step.calls.map(runTool))) record(result);
       }
     }
 
     const ended = agent.context_.at(-1) as RunEnded;
     if (ended.reason !== 'submitted') throw new Error(ended.message ?? `Investigation ended: ${ended.reason}`);
     const response = acceptedSubmission(agent)!;
-    for (const [i, excerpt] of (response.excerpts as any[]).entries()) {
-      notify({ type: 'entry', key: `excerpt:${i}`, kind: 'excerpt captured', text: `${excerpt.path} · lines ${excerpt.start}–${excerpt.end}` });
-    }
-    for (const [i, warning] of response.warnings.entries()) notify({ type: 'entry', key: `warning:${i}`, kind: 'evidence warning', text: warning });
     return { ...response, usage: usage(currentRun(agent)), turns: turnsInRun(agent), model: `${model.provider}/${model.id}`, agent };
   } catch (error) {
     const message = signal.aborted ? String(signal.reason?.message ?? signal.reason ?? 'Investigation cancelled') : String((error as Error).message ?? error);
