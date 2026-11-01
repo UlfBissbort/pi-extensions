@@ -1,12 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, copyFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { normalizeRequest, limitsForEffort, validateSubmission, selectLines, frame, assembleResponse, readBoundedText, extractPrompt, createSemaphore, addUsage, zeroUsage } from '../src/core.mjs';
 import { loadConfig, loadWorkerContext, stripDocumentMetadata, validateConfig } from '../src/config.mjs';
 const root = new URL('../', import.meta.url).pathname;
-const snapshot = await loadConfig(root);
+// Test the tracked defaults, not this checkout's optional config.local.json.
+const defaultsDir = await mkdtemp(join(tmpdir(), 'investigate-defaults-'));
+let snapshot;
+try {
+  await mkdir(join(defaultsDir, 'prompts'));
+  for (const path of ['config.json', 'repository-map.md', 'prompts/worker.md', 'prompts/parent.md']) {
+    await copyFile(join(root, path), join(defaultsDir, path));
+  }
+  snapshot = await loadConfig(defaultsDir);
+} finally {
+  await rm(defaultsDir, { recursive: true, force: true });
+}
 const { config } = snapshot;
 
 test('actual config and marked prompts load; defaults, model, and no editorial header', () => {
